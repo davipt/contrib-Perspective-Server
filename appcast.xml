@@ -3,6 +3,22 @@
     <channel>
         <title>Perspective Server Updates</title>
         <language>en</language>
-        <!-- Add <item> elements here for each release -->
+        <item>
+            <title>Version 1.0</title>
+            <pubDate>Sat, 01 Mar 2026 21:00:00 +0000</pubDate>
+            <sparkle:version>1</sparkle:version>
+            <sparkle:shortVersionString>1.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <description><![CDATA[
+                <h2>Perspective Server 1.0</h2>
+                <p>Initial release with Sparkle auto-updater, on-device AI inference, and session management.</p>
+            ]]></description>
+            <enclosure
+                url="https://github.com/Techopolis/Perspective-Server/releases/download/v1.0/PerspectiveServer-1.0.zip"
+                type="application/octet-stream"
+                sparkle:edSignature="5RKmjU3r12/unjCqetgYxTO3MLEcoOZ7yfbPTNTXiGyE4HuIYhbNjpWCrIEM0PlNhTHZuiYt7Ax4rAku8vEBBQ=="
+                length="1784209"
+            />
+        </item>
     </channel>
 </rss>
