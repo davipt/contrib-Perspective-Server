@@ -1,6 +1,6 @@
 //
-//  Perspective_IntelligenceApp.swift
-//  Perspective Intelligence
+//  Perspective_ServerApp.swift
+//  Perspective Server
 //
 //  Created by Michael Doise on 9/14/25.
 //
@@ -41,7 +41,7 @@ extension Notification.Name {
 #endif
 
 @main
-struct Perspective_IntelligenceApp: App {
+struct Perspective_ServerApp: App {
     #if os(macOS)
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var serverController = ServerController()
@@ -49,8 +49,7 @@ struct Perspective_IntelligenceApp: App {
     #endif
     
     init() {
-        // No auto-start - let the user manually start the server
-        // This avoids port conflicts with other services like Ollama
+        // Server auto-starts on launch via the MenuBarExtra .task modifier
     }
     
     var body: some Scene {
@@ -78,7 +77,7 @@ struct Perspective_IntelligenceApp: App {
                 }
         }
         .defaultSize(width: 600, height: 750)
-        .defaultLaunchBehavior(.presented)
+        .defaultLaunchBehavior(.suppressed)
         .commands {
             ChatCommands()
             CommandGroup(after: .newItem) {
@@ -90,14 +89,11 @@ struct Perspective_IntelligenceApp: App {
         }
         
         // Menu Bar Extra
-        MenuBarExtra("PI Server", systemImage: "bolt.horizontal.circle") {
+        MenuBarExtra("Perspective Server", systemImage: "bolt.horizontal.circle") {
             MenuBarContentView()
                 .environmentObject(serverController)
                 .task {
-                    let running = await LocalHTTPServer.shared.getIsRunning()
-                    await MainActor.run {
-                        serverController.isRunning = running
-                    }
+                    serverController.syncState()
                 }
         }
         

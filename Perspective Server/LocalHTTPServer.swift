@@ -5,19 +5,35 @@ import OSLog
 actor LocalHTTPServer {
     static let shared = LocalHTTPServer()
 
-    private let logger = Logger(subsystem: "com.example.PerspectiveIntelligence", category: "LocalHTTPServer")
+    private let logger = Logger(subsystem: "com.example.PerspectiveServer", category: "LocalHTTPServer")
     private var listener: NWListener?
     private var connections: Set<ConnectionWrapper> = []
 
     var port: UInt16 = 11434
     private(set) var isRunning: Bool = false
     private(set) var lastError: String? = nil
-    
+    private var activeRequestCount: Int = 0
+
     /// Ports to try in order if the primary port is unavailable
     private let fallbackPorts: [UInt16] = [11434, 11435, 11436, 11437, 8080]
+    private var portsToTry: [UInt16] = []
     private var currentPortIndex: Int = 0
 
     private init() {}
+
+    func incrementActiveRequests() -> Int {
+        activeRequestCount += 1
+        return activeRequestCount
+    }
+
+    func decrementActiveRequests() -> Int {
+        activeRequestCount -= 1
+        return activeRequestCount
+    }
+
+    func getActiveRequestCount() -> Int {
+        activeRequestCount
+    }
 
     // MARK: Lifecycle
 
@@ -27,19 +43,21 @@ actor LocalHTTPServer {
             return
         }
         lastError = nil
+        // Build port list: configured port first, then fallbacks (deduped)
+        portsToTry = [port] + fallbackPorts.filter { $0 != port }
         currentPortIndex = 0
         await tryStartOnNextPort()
     }
     
-    /// Attempts to start the server on the next available port in the fallback list
+    /// Attempts to start the server on the next available port in the list
     private func tryStartOnNextPort() async {
-        guard currentPortIndex < fallbackPorts.count else {
-            lastError = "Failed to start server: all ports in use (tried: \(fallbackPorts.map(String.init).joined(separator: ", ")))"
+        guard currentPortIndex < portsToTry.count else {
+            lastError = "Failed to start server: all ports in use (tried: \(portsToTry.map(String.init).joined(separator: ", ")))"
             logger.error("\\(self.lastError ?? \"\")")
             return
         }
-        
-        let targetPort = fallbackPorts[currentPortIndex]
+
+        let targetPort = portsToTry[currentPortIndex]
         self.port = targetPort
         
         do {
@@ -74,9 +92,14 @@ actor LocalHTTPServer {
 
     // MARK: Request handling
 
-    fileprivate func handleRequest(_ request: HTTPRequest) async -> ServerResponse {
+    nonisolated func handleRequest(_ request: HTTPRequest) async -> ServerResponse {
         // Correlate logs for this request
         let rid = String(UUID().uuidString.prefix(8))
+        let logger = Logger(subsystem: "com.example.PerspectiveServer", category: "LocalHTTPServer")
+
+        let _ = await self.incrementActiveRequests()
+        defer { Task { let _ = await self.decrementActiveRequests() } }
+
         // CORS preflight support
         if request.method == "OPTIONS" {
             return .normal(HTTPResponse(status: 204, headers: [
@@ -102,7 +125,7 @@ actor LocalHTTPServer {
     let contentLength = request.headers["content-length"] ?? request.headers["Content-Length"] ?? ""
         logger.log("[req:\(rid, privacy: .public)] HTTP \(request.method, privacy: .public) \(path, privacy: .public) ct=\(contentType, privacy: .public) cl=\(contentLength, privacy: .public)")
         if request.method == "POST" {
-            logger.log("[req:\(rid, privacy: .public)] body: \(self.truncateBodyForLog(request.bodyData), privacy: .public)")
+            logger.log("[req:\(rid, privacy: .public)] body: \(Self.truncateBodyForLog(request.bodyData), privacy: .public)")
         }
 
         // Route GET /v1/models (list)
@@ -129,10 +152,22 @@ actor LocalHTTPServer {
 
         // Debug: GET /debug/health -> simple health check
         if (request.method == "GET" || request.method == "HEAD") && path == "/debug/health" {
+            let serverIsRunning = await self.isRunning
+            let serverPort = await self.port
+            let activeReqs = await self.getActiveRequestCount()
+            let inferenceStats = await FoundationModelsService.shared.inferenceSemaphore.stats
             let obj: [String: Any] = [
                 "status": "ok",
-                "running": self.isRunning,
-                "port": self.port,
+                "running": serverIsRunning,
+                "port": serverPort,
+                "active_requests": activeReqs,
+                "inference": [
+                    "running": inferenceStats.running,
+                    "queued": inferenceStats.queued,
+                    "max_concurrent": inferenceStats.maxConcurrent,
+                    "total_completed": inferenceStats.totalCompleted,
+                    "total_queued": inferenceStats.totalQueued,
+                ]
             ]
             let data = (try? JSONSerialization.data(withJSONObject: obj, options: [])) ?? Data()
             let resp = HTTPResponse(status: 200, headers: [
@@ -176,7 +211,7 @@ actor LocalHTTPServer {
                 "/debug/echo"
             ]
             let obj: [String: Any] = [
-                "name": "Perspective Intelligence Local API",
+                "name": "Perspective Server Local API",
                 "endpoints": endpoints
             ]
             let data = (try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted])) ?? Data()
@@ -268,7 +303,7 @@ actor LocalHTTPServer {
                     "Access-Control-Allow-Origin": "*"
                 ], body: data))
             } catch {
-                logger.error("[req:\(rid, privacy: .public)] /api/chat error: \(String(describing: error), privacy: .public) body=\(self.truncateBodyForLog(request.bodyData), privacy: .public)")
+                logger.error("[req:\(rid, privacy: .public)] /api/chat error: \(String(describing: error), privacy: .public) body=\(Self.truncateBodyForLog(request.bodyData), privacy: .public)")
                 let msg = ["error": ["message": error.localizedDescription]]
                 let data = try? JSONSerialization.data(withJSONObject: msg, options: [])
                 return .normal(HTTPResponse(status: 400, headers: [
@@ -362,7 +397,7 @@ actor LocalHTTPServer {
                     return .stream(HTTPStreamResponse.sse(handler: { emitter in
                         let resp = try await FoundationModelsService.shared.handleCompletion(req)
                         let full = resp.choices.first?.text ?? ""
-                        self.logger.log("[req:\(rid, privacy: .public)] /v1/completions streaming text len=\(full.count)")
+                        logger.log("[req:\(rid, privacy: .public)] /v1/completions streaming text len=\(full.count)")
                         for chunk in StreamChunker.chunk(text: full) {
                             let event: [String: Any] = [
                                 "id": resp.id,
@@ -386,7 +421,7 @@ actor LocalHTTPServer {
                     ], body: data))
                 }
             } catch {
-                logger.error("[req:\(rid, privacy: .public)] /v1/completions error: \(String(describing: error), privacy: .public) body=\(self.truncateBodyForLog(request.bodyData), privacy: .public)")
+                logger.error("[req:\(rid, privacy: .public)] /v1/completions error: \(String(describing: error), privacy: .public) body=\(Self.truncateBodyForLog(request.bodyData), privacy: .public)")
                 let msg = ["error": ["message": error.localizedDescription]]
                 let data = try? JSONSerialization.data(withJSONObject: msg, options: [])
                 return .normal(HTTPResponse(status: 400, headers: [
@@ -406,7 +441,7 @@ actor LocalHTTPServer {
                     return .stream(HTTPStreamResponse.ndjson(handler: { emitter in
                         let resp = try await FoundationModelsService.shared.handleCompletion(req)
                         let full = resp.choices.first?.text ?? ""
-                        self.logger.log("[req:\(rid, privacy: .public)] /api/generate streaming text len=\(full.count)")
+                        logger.log("[req:\(rid, privacy: .public)] /api/generate streaming text len=\(full.count)")
                         for chunk in StreamChunker.chunk(text: full) {
                             let event: [String: Any] = [
                                 "model": resp.model,
@@ -433,7 +468,7 @@ actor LocalHTTPServer {
                     ], body: data))
                 }
             } catch {
-                logger.error("[req:\(rid, privacy: .public)] /api/generate error: \(String(describing: error), privacy: .public) body=\(self.truncateBodyForLog(request.bodyData), privacy: .public)")
+                logger.error("[req:\(rid, privacy: .public)] /api/generate error: \(String(describing: error), privacy: .public) body=\(Self.truncateBodyForLog(request.bodyData), privacy: .public)")
                 let msg = ["error": ["message": error.localizedDescription]]
                 let data = try? JSONSerialization.data(withJSONObject: msg, options: [])
                 return .normal(HTTPResponse(status: 400, headers: [
@@ -450,19 +485,49 @@ actor LocalHTTPServer {
                 let req = try decoder.decode(ChatCompletionRequest.self, from: request.bodyData)
                 if req.stream == true {
                     return .stream(HTTPStreamResponse.sse(handler: { emitter in
-                        // If tools are present in the request, route through single response path (no multi-segment)
                         let hasTools: Bool = {
                             if let data = String(data: request.bodyData, encoding: .utf8)?.lowercased() {
                                 return data.contains("\"tools\"") && !data.contains("\"tools\": []")
                             }
                             return false
                         }()
-                        let useMulti = (!hasTools) && ((req.multi_segment ?? true) == true)
-                        if useMulti {
-                            // Stream multi-segment output piecewise
-                            let streamId = "chatcmpl_" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
-                            let created = Int(Date().timeIntervalSince1970)
-                            self.logger.log("[req:\(rid, privacy: .public)] /v1/chat/completions streaming mode=multi segmentChars=1400 maxSegments=6")
+                        let useMulti = (!hasTools) && (req.multi_segment == true)
+
+                        let streamId = "chatcmpl_" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+                        let created = Int(Date().timeIntervalSince1970)
+                        var resolvedSessionID: String? = nil
+
+                        if hasTools {
+                            // Tools path: generate full response then chunk it
+                            logger.log("[req:\(rid, privacy: .public)] /v1/chat/completions streaming mode=tools-fallback")
+                            do {
+                                let resp = try await FoundationModelsService.shared.handleChatCompletion(req)
+                                let full = resp.choices.first?.message.content ?? ""
+                                for chunk in StreamChunker.chunk(text: full) {
+                                    let event: [String: Any] = [
+                                        "id": streamId,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": req.model,
+                                        "choices": [["index": 0, "delta": ["content": chunk]]]
+                                    ]
+                                    try? await emitter.emitSSE(json: event)
+                                }
+                            } catch {
+                                logger.error("[req:\(rid, privacy: .public)] tools streaming error: \(String(describing: error), privacy: .public)")
+                                let fallback = "(Local fallback) Unable to generate a response. This may be due to safety guardrails or an unavailable model."
+                                let event: [String: Any] = [
+                                    "id": streamId,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": req.model,
+                                    "choices": [["index": 0, "delta": ["content": fallback]]]
+                                ]
+                                try? await emitter.emitSSE(json: event)
+                            }
+                        } else if useMulti {
+                            // Legacy multi-segment mode (opt-in only via multi_segment=true)
+                            logger.log("[req:\(rid, privacy: .public)] /v1/chat/completions streaming mode=multi segmentChars=1400 maxSegments=6")
                             do {
                                 try await FoundationModelsService.shared.generateChatSegments(messages: req.messages, model: req.model, temperature: req.temperature, segmentChars: 1400, maxSegments: 6) { segment in
                                     let event: [String: Any] = [
@@ -474,20 +539,9 @@ actor LocalHTTPServer {
                                     ]
                                     try? await emitter.emitSSE(json: event)
                                 }
-                                // Send terminal chunk with finish_reason before closing
-                                let finalEvent: [String: Any] = [
-                                    "id": streamId,
-                                    "object": "chat.completion.chunk",
-                                    "created": created,
-                                    "model": req.model,
-                                    "choices": [["index": 0, "delta": [:], "finish_reason": "stop"]]
-                                ]
-                                try? await emitter.emitSSE(json: finalEvent)
-                                try? await emitter.emitSSE(raw: "[DONE]")
                             } catch {
-                                // Safety guardrails or other FM errors: emit a friendly fallback and end stream
-                                self.logger.error("[req:\(rid, privacy: .public)] multi-segment generation failed: \(String(describing: error), privacy: .public)")
-                                let fallback = "(Local fallback) Unable to continue the streamed response right now. This may be due to safety guardrails or an unavailable on-device model. Please try rephrasing or reducing sensitive content."
+                                logger.error("[req:\(rid, privacy: .public)] multi-segment generation failed: \(String(describing: error), privacy: .public)")
+                                let fallback = "(Local fallback) Unable to continue the streamed response. Please try rephrasing."
                                 let event: [String: Any] = [
                                     "id": streamId,
                                     "object": "chat.completion.chunk",
@@ -496,41 +550,53 @@ actor LocalHTTPServer {
                                     "choices": [["index": 0, "delta": ["content": fallback]]]
                                 ]
                                 try? await emitter.emitSSE(json: event)
-                                let finalEvent: [String: Any] = [
+                            }
+                        } else {
+                            // DEFAULT: True token-by-token streaming via Foundation Models streamResponse
+                            logger.log("[req:\(rid, privacy: .public)] /v1/chat/completions streaming mode=token-stream sessionID=\(req.session_id ?? "new", privacy: .public)")
+                            do {
+                                resolvedSessionID = try await FoundationModelsService.shared.streamChatCompletion(
+                                    messages: req.messages,
+                                    model: req.model,
+                                    temperature: req.temperature,
+                                    sessionID: req.session_id
+                                ) { delta in
+                                    let event: [String: Any] = [
+                                        "id": streamId,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": req.model,
+                                        "choices": [["index": 0, "delta": ["content": delta]]]
+                                    ]
+                                    try? await emitter.emitSSE(json: event)
+                                }
+                            } catch {
+                                logger.error("[req:\(rid, privacy: .public)] token streaming failed: \(String(describing: error), privacy: .public)")
+                                let fallback = "(Local fallback) Unable to stream a response. Please try rephrasing."
+                                let event: [String: Any] = [
                                     "id": streamId,
                                     "object": "chat.completion.chunk",
                                     "created": created,
                                     "model": req.model,
-                                    "choices": [["index": 0, "delta": [:], "finish_reason": "stop"]]
+                                    "choices": [["index": 0, "delta": ["content": fallback]]]
                                 ]
-                                try? await emitter.emitSSE(json: finalEvent)
-                                try? await emitter.emitSSE(raw: "[DONE]")
+                                try? await emitter.emitSSE(json: event)
                             }
-                        } else {
-                            let resp = try await FoundationModelsService.shared.handleChatCompletion(req)
-                            let full = resp.choices.first?.message.content ?? ""
-                            self.logger.log("[req:\(rid, privacy: .public)] /v1/chat/completions streaming msg len=\(full.count)")
-                            for chunk in StreamChunker.chunk(text: full) {
-                                let event: [String: Any] = [
-                                    "id": resp.id,
-                                    "object": "chat.completion.chunk",
-                                    "created": resp.created,
-                                    "model": resp.model,
-                                    "choices": [["index": 0, "delta": ["content": chunk]]]
-                                ]
-                                try await emitter.emitSSE(json: event)
-                            }
-                            // Final terminal chunk with finish_reason
-                            let finalEvent: [String: Any] = [
-                                "id": resp.id,
-                                "object": "chat.completion.chunk",
-                                "created": resp.created,
-                                "model": resp.model,
-                                "choices": [["index": 0, "delta": [:], "finish_reason": "stop"]]
-                            ]
-                            try await emitter.emitSSE(json: finalEvent)
-                            try await emitter.emitSSE(raw: "[DONE]")
                         }
+
+                        // Terminal chunk + [DONE] for all paths
+                        var finalEvent: [String: Any] = [
+                            "id": streamId,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": req.model,
+                            "choices": [["index": 0, "delta": [:], "finish_reason": "stop"]]
+                        ]
+                        if let sid = resolvedSessionID {
+                            finalEvent["session_id"] = sid
+                        }
+                        try? await emitter.emitSSE(json: finalEvent)
+                        try? await emitter.emitSSE(raw: "[DONE]")
                     }))
                 } else {
                     let resp = try await FoundationModelsService.shared.handleChatCompletion(req)
@@ -542,7 +608,7 @@ actor LocalHTTPServer {
                     ], body: data))
                 }
             } catch {
-                logger.error("[req:\(rid, privacy: .public)] /v1/chat/completions error: \(String(describing: error), privacy: .public) body=\(self.truncateBodyForLog(request.bodyData), privacy: .public)")
+                logger.error("[req:\(rid, privacy: .public)] /v1/chat/completions error: \(String(describing: error), privacy: .public) body=\(Self.truncateBodyForLog(request.bodyData), privacy: .public)")
                 let msg = ["error": ["message": error.localizedDescription]]
                 let data = try? JSONSerialization.data(withJSONObject: msg, options: [])
                 return .normal(HTTPResponse(status: 400, headers: [
@@ -610,6 +676,14 @@ actor LocalHTTPServer {
         wrapper.start()
     }
 
+    nonisolated fileprivate func removeConnection(_ wrapper: ConnectionWrapper) {
+        Task { await self._removeConnection(wrapper) }
+    }
+
+    private func _removeConnection(_ wrapper: ConnectionWrapper) {
+        connections.remove(wrapper)
+    }
+
     // Public actor APIs for cross-actor access
     func setPort(_ newPort: UInt16) {
         self.port = newPort
@@ -639,7 +713,7 @@ extension LocalHTTPServer {
     /// Enabled if either:
     /// - UserDefaults: `debugFullRequestLog` or `debugLogging` is true, or
     /// - Env var `PI_DEBUG_FULL_LOG=1` is present.
-    private func debugFullRequestLogEnabled() -> Bool {
+    nonisolated private static func debugFullRequestLogEnabled() -> Bool {
         let defaults = UserDefaults.standard
         if defaults.bool(forKey: "debugFullRequestLog") { return true }
         if defaults.bool(forKey: "debugLogging") { return true }
@@ -647,7 +721,7 @@ extension LocalHTTPServer {
         return false
     }
 
-    fileprivate func truncateBodyForLog(_ data: Data, limit: Int = 8192) -> String {
+    nonisolated static func truncateBodyForLog(_ data: Data, limit: Int = 8192) -> String {
         guard let s = String(data: data, encoding: .utf8) else { return "<non-utf8 body \(data.count) bytes>" }
         let redacted = redactAuthorization(in: s)
         if debugFullRequestLogEnabled() { return redacted.replacingOccurrences(of: "\n", with: "\\n") }
@@ -656,7 +730,7 @@ extension LocalHTTPServer {
         return redacted[redacted.startIndex..<idx].replacingOccurrences(of: "\n", with: "\\n") + "… (truncated)"
     }
 
-    private func redactAuthorization(in s: String) -> String {
+    nonisolated private static func redactAuthorization(in s: String) -> String {
         if s.lowercased().contains("authorization") {
             // Very simple masking for tokens in body if present
             return s.replacingOccurrences(of: "Authorization", with: "Authorization(REDACTED)")
@@ -671,7 +745,7 @@ private final class ConnectionWrapper: @unchecked Sendable, Hashable {
     static func == (lhs: ConnectionWrapper, rhs: ConnectionWrapper) -> Bool { lhs === rhs }
     func hash(into hasher: inout Hasher) { hasher.combine(ObjectIdentifier(self)) }
 
-    private let logger = Logger(subsystem: "com.example.PerspectiveIntelligence", category: "Connection")
+    private let logger = Logger(subsystem: "com.example.PerspectiveServer", category: "Connection")
     private let connection: NWConnection
     private unowned let server: LocalHTTPServer
     private var buffer = Data()
@@ -701,6 +775,7 @@ private final class ConnectionWrapper: @unchecked Sendable, Hashable {
         guard !didCancel else { return }
         didCancel = true
         connection.cancel()
+        server.removeConnection(self)
     }
 
     private func receive() {
@@ -765,6 +840,8 @@ private final class ConnectionWrapper: @unchecked Sendable, Hashable {
     }
 
     // Actor that owns writes to the NWConnection during a streaming response
+    // Each send awaits the completion handler to ensure data flushes to the network
+    // before the next chunk is sent — critical for real-time SSE streaming.
     private actor StreamSender {
         private let connection: NWConnection
 
@@ -772,19 +849,26 @@ private final class ConnectionWrapper: @unchecked Sendable, Hashable {
             self.connection = connection
         }
 
-        func sendChunked(_ data: Data) {
+        func sendChunked(_ data: Data) async {
             let prefix = String(format: "%@\r\n", String(data.count, radix: 16)).data(using: .utf8) ?? Data()
             var out = Data()
             out.append(prefix)
             out.append(data)
             out.append(Data("\r\n".utf8))
-            connection.send(content: out, completion: .contentProcessed({ _ in }))
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                connection.send(content: out, completion: .contentProcessed({ _ in
+                    continuation.resume()
+                }))
+            }
         }
 
-        func finish() {
-            connection.send(content: Data("0\r\n\r\n".utf8), completion: .contentProcessed({ _ in
-                self.connection.cancel()
-            }))
+        func finish() async {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                connection.send(content: Data("0\r\n\r\n".utf8), completion: .contentProcessed({ _ in
+                    self.connection.cancel()
+                    continuation.resume()
+                }))
+            }
         }
     }
 
@@ -830,7 +914,7 @@ private final class ConnectionWrapper: @unchecked Sendable, Hashable {
 
 // MARK: - HTTP Types
 
-struct HTTPRequest {
+struct HTTPRequest: Sendable {
     let method: String
     let path: String
     let headers: [String: String]
@@ -867,7 +951,7 @@ struct HTTPResponse {
 
 // MARK: - Streaming Support
 
-enum ServerResponse {
+enum ServerResponse: Sendable {
     case normal(HTTPResponse)
     case stream(HTTPStreamResponse)
 }

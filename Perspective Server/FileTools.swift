@@ -1,6 +1,6 @@
 //
 //  FileTools.swift
-//  Perspective Intelligence
+//  Perspective Server
 //
 //  File operation tools for Apple Foundation Models
 //

@@ -1,6 +1,6 @@
 //
 //  ServerDashboardView.swift
-//  Perspective Intelligence
+//  Perspective Server
 //
 //  Main dashboard UI for server management
 //
@@ -110,7 +110,7 @@ struct ServerDashboardView: View {
             }
             
             VStack(alignment: .leading, spacing: 4) {
-                Text("Perspective Intelligence")
+                Text("Perspective Server")
                     .font(.system(size: 26, weight: .bold))
                     .foregroundColor(.primary)
                 

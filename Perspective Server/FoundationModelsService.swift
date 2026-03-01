@@ -1,6 +1,6 @@
 //
 //  FoundationModelsService.swift
-//  Perspective Intelligence
+//  Perspective Server
 //
 //  Created by Michael Doise on 9/14/25.
 //
@@ -65,6 +65,7 @@ struct ChatCompletionRequest: Codable {
     // OpenAI-style tools support (optional)
     let tools: [OAITool]?
     let tool_choice: ToolChoice?
+    var session_id: String?
 }
 
 // Content part per OpenAI structured content. We only use text; non-text parts are ignored.
@@ -88,6 +89,7 @@ struct ChatCompletionResponse: Codable {
     let created: Int
     let model: String
     let choices: [Choice]
+    var session_id: String?
 }
 
 // MARK: - OpenAI Tools Types
@@ -252,20 +254,131 @@ struct OpenAIModelList: Codable {
     let data: [OpenAIModel]
 }
 
+// MARK: - Inference Semaphore
+
+/// Limits concurrent LLM inference calls to prevent memory pressure and optimize throughput.
+/// Requests beyond the limit wait in a FIFO queue until a slot opens.
+actor InferenceSemaphore {
+    private let maxConcurrent: Int
+    private var running: Int = 0
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+
+    /// Total requests completed since server start
+    private var totalCompleted: Int = 0
+    /// Total requests that had to wait in queue
+    private var totalQueued: Int = 0
+
+    init(maxConcurrent: Int) {
+        self.maxConcurrent = maxConcurrent
+    }
+
+    func acquire() async {
+        if running < maxConcurrent {
+            running += 1
+            return
+        }
+        totalQueued += 1
+        await withCheckedContinuation { continuation in
+            waiting.append(continuation)
+        }
+    }
+
+    func release() {
+        running -= 1
+        totalCompleted += 1
+        if !waiting.isEmpty {
+            let next = waiting.removeFirst()
+            running += 1
+            next.resume()
+        }
+    }
+
+    var stats: (running: Int, queued: Int, maxConcurrent: Int, totalCompleted: Int, totalQueued: Int) {
+        (running, waiting.count, maxConcurrent, totalCompleted, totalQueued)
+    }
+}
+
+// MARK: - Session Manager
+
+#if canImport(FoundationModels)
+/// Caches LanguageModelSession instances by ID so conversations maintain context across turns.
+/// Sessions expire after 30 minutes of inactivity and the cache holds at most 50 sessions.
+@available(macOS 26.0, iOS 26.0, visionOS 26.0, *)
+actor SessionManager {
+    private struct CachedSession {
+        let session: LanguageModelSession
+        var lastAccessed: Date
+    }
+
+    private var cache: [String: CachedSession] = [:]
+    private let maxSessions = 50
+    private let ttl: TimeInterval = 30 * 60
+
+    func get(_ id: String) -> LanguageModelSession? {
+        guard var entry = cache[id] else { return nil }
+        if Date().timeIntervalSince(entry.lastAccessed) > ttl {
+            cache.removeValue(forKey: id)
+            return nil
+        }
+        entry.lastAccessed = Date()
+        cache[id] = entry
+        return entry.session
+    }
+
+    func store(_ id: String, session: LanguageModelSession) {
+        evictIfNeeded()
+        cache[id] = CachedSession(session: session, lastAccessed: Date())
+    }
+
+    private func evictIfNeeded() {
+        let now = Date()
+        cache = cache.filter { now.timeIntervalSince($0.value.lastAccessed) <= ttl }
+        while cache.count >= maxSessions {
+            if let oldest = cache.min(by: { $0.value.lastAccessed < $1.value.lastAccessed }) {
+                cache.removeValue(forKey: oldest.key)
+            }
+        }
+    }
+
+    var count: Int { cache.count }
+}
+#endif
+
 // MARK: - Foundation Models Service
 
 /// A service that bridges OpenAI-compatible requests to Apple's on-device Foundation Models.
 final class FoundationModelsService: @unchecked Sendable {
     static let shared = FoundationModelsService()
-    private let logger = Logger(subsystem: "com.example.PerspectiveIntelligence", category: "FoundationModelsService")
+    private let logger = Logger(subsystem: "com.example.PerspectiveServer", category: "FoundationModelsService")
     private let createdEpoch: Int = Int(Date().timeIntervalSince1970)
-    
+
+    /// Controls how many LLM inference calls run concurrently.
+    /// Additional requests queue in FIFO order until a slot opens.
+    let inferenceSemaphore = InferenceSemaphore(maxConcurrent: 3)
+
+    /// Backing storage for the session manager (type-erased for conditional compilation)
+    private var _sessionManager: Any? = nil
+
+    #if canImport(FoundationModels)
+    @available(macOS 26.0, iOS 26.0, visionOS 26.0, *)
+    var sessionManager: SessionManager {
+        if let existing = _sessionManager as? SessionManager { return existing }
+        let manager = SessionManager()
+        _sessionManager = manager
+        return manager
+    }
+    #endif
+
     private init() {}
 
     // MARK: Public API
 
     /// Handles an OpenAI-compatible chat completion request and returns a response.
+    /// Requests are queued through the inference semaphore to manage concurrency.
     func handleChatCompletion(_ request: ChatCompletionRequest) async throws -> ChatCompletionResponse {
+        await inferenceSemaphore.acquire()
+        defer { Task { await inferenceSemaphore.release() } }
+
         // Always use tools for file operations - this enables the model to create/edit files
         // even when the client doesn't explicitly request tool support
         #if canImport(FoundationModels)
@@ -274,7 +387,7 @@ final class FoundationModelsService: @unchecked Sendable {
             return try await handleChatCompletionWithBuiltInTools(request)
         }
         #endif
-        
+
         // Fallback for older systems: If tools are provided, run the tool-calling orchestration flow.
         if let tools = request.tools, !tools.isEmpty {
             return try await handleChatCompletionWithTools(request, tools: tools)
@@ -303,7 +416,171 @@ final class FoundationModelsService: @unchecked Sendable {
         )
         return response
     }
-    
+
+    // MARK: - True Token Streaming
+
+    /// Streams a chat completion token-by-token using Foundation Models' streamResponse API.
+    /// Each delta (new text since last yield) is passed to the `emit` callback immediately.
+    /// Falls back to single-response chunking on systems without FoundationModels.
+    /// Returns the resolved session ID (existing or newly created) for the caller to include in SSE.
+    @discardableResult
+    func streamChatCompletion(
+        messages: [ChatCompletionRequest.Message],
+        model: String,
+        temperature: Double?,
+        sessionID: String? = nil,
+        emit: @escaping @Sendable (String) async -> Void
+    ) async throws -> String {
+        await inferenceSemaphore.acquire()
+        defer { Task { await inferenceSemaphore.release() } }
+
+        let resolvedID = sessionID ?? UUID().uuidString
+
+        #if canImport(FoundationModels)
+        if #available(macOS 26.0, iOS 26.0, visionOS 26.0, *) {
+            try await streamWithFoundationModels(
+                messages: messages,
+                model: model,
+                temperature: temperature,
+                sessionID: resolvedID,
+                emit: emit
+            )
+            return resolvedID
+        }
+        #endif
+
+        // Fallback for systems without FoundationModels: generate full response and chunk it
+        let prompt = await prepareChatPrompt(
+            messages: messages, model: model,
+            temperature: temperature, maxTokens: nil
+        )
+        let output = try await generateText(
+            model: model, prompt: prompt,
+            temperature: temperature, maxTokens: nil
+        )
+        for chunk in StreamChunker.chunk(text: output, size: 16) {
+            await emit(chunk)
+        }
+        return resolvedID
+    }
+
+    #if canImport(FoundationModels)
+    /// True token-by-token streaming using LanguageModelSession.streamResponse(to:).
+    /// Reuses a cached session when sessionID matches, otherwise creates and caches a new one.
+    /// The stream yields cumulative content; we compute deltas by comparing with previous content.
+    @available(macOS 26.0, iOS 26.0, visionOS 26.0, *)
+    private func streamWithFoundationModels(
+        messages: [ChatCompletionRequest.Message],
+        model: String,
+        temperature: Double?,
+        sessionID: String,
+        emit: @escaping @Sendable (String) async -> Void
+    ) async throws {
+        let systemModel = SystemLanguageModel.default
+
+        switch systemModel.availability {
+        case .available:
+            break
+        case .unavailable(let reason):
+            logger.error("[fm-stream] Model unavailable: \(String(describing: reason))")
+            throw NSError(
+                domain: "FoundationModelsService", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Model unavailable: \(String(describing: reason))"]
+            )
+        }
+
+        // Extract the system prompt from messages (sent by the web app as the first message).
+        // This goes into the session's instructions parameter, NOT into the user prompt.
+        // Mixing system instructions into the user message triggers guardrail false positives.
+        let clientSystemPrompt = messages.first(where: { $0.role == "system" })?.content
+        let instructions = clientSystemPrompt ?? "You are a helpful assistant."
+
+        // Extract ONLY the last user message — this is what we send to the model.
+        // Previous conversation context is maintained by the session's built-in transcript.
+        let userMessage = messages.last(where: { $0.role == "user" })?.content ?? messages.last?.content ?? ""
+
+        // Try to reuse a cached session
+        var session: LanguageModelSession
+        let isExistingSession: Bool
+
+        if let cached = await sessionManager.get(sessionID) {
+            session = cached
+            isExistingSession = true
+            logger.log("[fm-stream] reusing cached session \(sessionID, privacy: .public)")
+        } else {
+            // Create session with clean instructions (matching Perspective Chat pattern).
+            // DO NOT include model identifiers, temperature text, or other metadata in instructions.
+            // Temperature is handled via GenerationOptions, not instruction text.
+            session = LanguageModelSession(instructions: instructions)
+            isExistingSession = false
+            logger.log("[fm-stream] created new session \(sessionID, privacy: .public) instructions=\(instructions.prefix(80), privacy: .public)")
+        }
+
+        // Always send just the user's message — never a concatenated prompt blob.
+        // The session maintains conversation history internally for multi-turn context.
+        let prompt = userMessage
+
+        logger.log("[fm-stream] starting stream, prompt len=\(prompt.count), cached=\(isExistingSession)")
+
+        do {
+            let stream = session.streamResponse(to: prompt)
+
+            var lastContent = ""
+            for try await partialResponse in stream {
+                let currentContent = partialResponse.content
+                if currentContent.count > lastContent.count {
+                    let delta = String(currentContent.dropFirst(lastContent.count))
+                    if !delta.isEmpty {
+                        await emit(delta)
+                    }
+                }
+                lastContent = currentContent
+            }
+
+            // Check if the model returned a soft refusal (not thrown as an error).
+            // These poison the session transcript and cause every follow-up to refuse too.
+            // IMPORTANT: Apple's model often uses Unicode curly apostrophes (\u{2019}) instead of ASCII ('),
+            // so we normalize them before matching.
+            let lower = lastContent.lowercased().replacingOccurrences(of: "\u{2019}", with: "'")
+            let isSoftRefusal = lower.contains("i can't assist") ||
+                lower.contains("i cannot assist") ||
+                lower.contains("i'm not able to help") ||
+                lower.contains("i can't help with that") ||
+                lower.contains("i cannot help with that") ||
+                lower.contains("sorry, but i can't") ||
+                lower.contains("sorry, i can't") ||
+                (lower.contains("sorry") && lower.contains("can't") && lastContent.count < 150)
+
+            if isSoftRefusal {
+                // Evict the poisoned session so the next message gets a fresh one
+                logger.warning("[fm-stream] Soft refusal detected for session \(sessionID, privacy: .public) — evicting to prevent refusal spiral")
+                await sessionManager.store(sessionID, session: LanguageModelSession(instructions: instructions))
+            } else {
+                // Cache the healthy session for reuse
+                await sessionManager.store(sessionID, session: session)
+            }
+
+            let cachedCount = await sessionManager.count
+            logger.log("[fm-stream] stream complete, total len=\(lastContent.count), refusal=\(isSoftRefusal), session=\(sessionID, privacy: .public), cached sessions=\(cachedCount)")
+        } catch {
+            // Handle ALL errors gracefully to prevent the "Unable to stream" fallback.
+            // Always evict the session on error — a poisoned transcript causes refusal spirals.
+            let errorDesc = String(reflecting: error).lowercased()
+            let isGuardrail = errorDesc.contains("guardrailviolation") || errorDesc.contains("refusal") || errorDesc.contains("safety")
+
+            if isGuardrail {
+                logger.warning("[fm-stream] Guardrail/refusal for session \(sessionID, privacy: .public) — evicting session: \(errorDesc.prefix(120), privacy: .public)")
+            } else {
+                logger.error("[fm-stream] Stream error for session \(sessionID, privacy: .public) — evicting session: \(errorDesc.prefix(200), privacy: .public)")
+            }
+
+            // Always evict — any error during streaming may have corrupted the session transcript
+            await sessionManager.store(sessionID, session: LanguageModelSession(instructions: instructions))
+            await emit("I'm not able to help with that particular request. Could you try rephrasing or asking something different?")
+        }
+    }
+    #endif
+
     #if canImport(FoundationModels)
     /// Handle chat completion with built-in file tools using native Foundation Models
     /// IMPORTANT: Apple's on-device model has a strict 4096 token limit (~16K chars total including tools)
@@ -536,14 +813,16 @@ final class FoundationModelsService: @unchecked Sendable {
 
     // MARK: - Context management for Chat
 
-    /// Prepares a prompt that fits within the strict 4096 token context limit.
-    /// Apple's on-device model cannot exceed this, so we must be VERY aggressive.
+    /// Prepares a clean user prompt from the messages array.
+    /// System prompts are NOT included here — they belong in LanguageModelSession instructions.
+    /// Mixing role prefixes (e.g., "system:", "user:") into the prompt text triggers guardrail
+    /// false positives because the model interprets it as prompt injection.
     private func prepareChatPrompt(messages: [ChatCompletionRequest.Message], model: String, temperature: Double?, maxTokens: Int?) async -> String {
         // Apple's model has a HARD 4096 token limit (~16K chars total).
         // With response needing ~1000 tokens, we can only use ~3000 tokens (~12K chars) for input.
-        // Being conservative: target 6K chars max to leave room for response.
-        let maxInputChars = 6000
-        
+        // Being conservative: target 4K chars max to leave room for response + instructions.
+        let maxInputChars = 4000
+
         // Find the LAST user message - this is what actually matters
         var lastUserContent = ""
         for msg in messages.reversed() {
@@ -552,54 +831,26 @@ final class FoundationModelsService: @unchecked Sendable {
                 break
             }
         }
-        
+
         // Extract just the user's actual request (skip Xcode boilerplate)
         var userRequest = lastUserContent
-        
+
         // Look for "The user has asked:" pattern from Xcode extension
         if let askedRange = userRequest.range(of: "The user has asked:", options: .caseInsensitive) {
             userRequest = String(userRequest[askedRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        
-        // Also check for "```" code blocks and extract file context if present
-        var fileContext = ""
-        if let codeStart = lastUserContent.range(of: "```") {
-            if let codeEnd = lastUserContent.range(of: "```", range: codeStart.upperBound..<lastUserContent.endIndex) {
-                let codeBlock = String(lastUserContent[codeStart.lowerBound..<codeEnd.upperBound])
-                // Only include if it's reasonably sized
-                if codeBlock.count < 2000 {
-                    fileContext = "Context:\n" + codeBlock + "\n\n"
-                } else {
-                    // Take just the first part of the code
-                    fileContext = "Context (truncated):\n" + String(codeBlock.prefix(1500)) + "...```\n\n"
-                }
-            }
-        }
-        
-        // Build minimal system context
-        let systemContext = "You are a helpful coding assistant."
-        
+
         // Truncate user request if needed
-        let maxUserChars = maxInputChars - systemContext.count - fileContext.count - 200
-        if userRequest.count > maxUserChars {
-            userRequest = String(userRequest.prefix(maxUserChars)) + "..."
+        if userRequest.count > maxInputChars {
+            userRequest = String(userRequest.prefix(maxInputChars)) + "..."
         }
-        
-        // Build final prompt
-        var parts: [String] = []
-        parts.append("system: \(systemContext)")
-        if !fileContext.isEmpty {
-            parts.append(fileContext)
-        }
-        parts.append("user: \(userRequest)")
-        parts.append("assistant:")
-        
-        let result = parts.joined(separator: "\n")
-        let estimatedTokens = approxTokenCount(result)
-        
-        logger.log("[chat.ctx] final prompt: chars=\(result.count) tokens≈\(estimatedTokens)")
-        
-        return result
+
+        let estimatedTokens = approxTokenCount(userRequest)
+        logger.log("[chat.ctx] final prompt: chars=\(userRequest.count) tokens≈\(estimatedTokens)")
+
+        // Return ONLY the user's message — no role prefixes, no "assistant:" suffix.
+        // The LanguageModelSession handles role separation internally.
+        return userRequest
     }
 
     /// Rough token estimate (heuristic): ~4 chars per token.
@@ -643,6 +894,8 @@ final class FoundationModelsService: @unchecked Sendable {
 
     /// Handles an OpenAI-compatible text completion request and returns a response.
     func handleCompletion(_ request: TextCompletionRequest) async throws -> TextCompletionResponse {
+        await inferenceSemaphore.acquire()
+        defer { Task { await inferenceSemaphore.release() } }
         logger.log("[text] model=\(request.model, privacy: .public) promptLen=\(request.prompt.count)")
         let output = try await generateText(model: request.model, prompt: request.prompt, temperature: request.temperature, maxTokens: request.max_tokens)
         logger.log("[text] outputLen=\(output.count)")
@@ -687,6 +940,8 @@ final class FoundationModelsService: @unchecked Sendable {
     }
 
     func handleOllamaChat(_ request: OllamaChatRequest) async throws -> OllamaChatResponse {
+        await inferenceSemaphore.acquire()
+        defer { Task { await inferenceSemaphore.release() } }
         let temperature = request.options?.temperature
         let maxTokens = request.options?.num_predict
         // Reuse our chat completion pipeline by mapping roles/content
@@ -885,22 +1140,26 @@ final class FoundationModelsService: @unchecked Sendable {
             throw NSError(domain: "FoundationModelsService", code: 4, userInfo: [NSLocalizedDescriptionKey: "Model unavailable: \(String(describing: other))"])
         }
 
-        // Build instructions from the requested model and temperature to guide style
-        var instructionsParts: [String] = []
-        instructionsParts.append("You are a helpful assistant. Keep responses clear and relevant.")
-        instructionsParts.append("Requested model identifier: \(model)")
-        if let temperature { instructionsParts.append("Use creativity level (temperature): \(temperature)") }
-        let instructions = instructionsParts.joined(separator: "\n")
+        // Lean instructions only — no model identifiers or temperature text.
+        // Matches the Perspective Chat pattern: minimal instructions to avoid guardrail triggers.
+        let instructions = "You are a helpful assistant."
 
         // Create a short-lived session for this request
         let session = LanguageModelSession(instructions: instructions)
 
-        // The current API does not expose maxTokens directly on respond; keep it in instructions.
-        // You can also truncate on your side after response if needed.
         logger.log("[fm] requesting response len=\(prompt.count)")
-        let response = try await session.respond(to: prompt)
-        logger.log("[fm] got response len=\(response.content.count)")
-        return response.content
+        do {
+            let response = try await session.respond(to: prompt)
+            logger.log("[fm] got response len=\(response.content.count)")
+            return response.content
+        } catch {
+            let errorDesc = String(reflecting: error).lowercased()
+            if errorDesc.contains("guardrailviolation") || errorDesc.contains("refusal") {
+                logger.warning("[fm] Guardrail/refusal hit — returning friendly message")
+                return "I'm not able to help with that particular request. Could you try rephrasing or asking something different?"
+            }
+            throw error
+        }
     }
     
     /// Generate text with native Foundation Models Tool support
@@ -916,13 +1175,8 @@ final class FoundationModelsService: @unchecked Sendable {
             throw NSError(domain: "FoundationModelsService", code: 1, userInfo: [NSLocalizedDescriptionKey: "Model unavailable: \(String(describing: reason))"])
         }
         
-        // Build instructions
-        var instructionsParts: [String] = []
-        instructionsParts.append("You are a helpful assistant with access to file operation tools.")
-        instructionsParts.append("When you need to read, write, edit, or manage files, use the available tools.")
-        instructionsParts.append("Requested model identifier: \(model)")
-        if let temperature { instructionsParts.append("Use creativity level (temperature): \(temperature)") }
-        let instructions = instructionsParts.joined(separator: "\n")
+        // Lean instructions — no model identifiers or temperature text (wastes tokens, confuses model)
+        let instructions = "You are a helpful assistant with access to file operation tools. When you need to read, write, edit, or manage files, use the available tools."
         
         // Create session with file tools
         let session = LanguageModelSession(
@@ -967,6 +1221,8 @@ extension FoundationModelsService {
     /// Generate a long-form response in multiple segments by chaining short sessions.
     /// Each segment is streamed back via the `emit` callback as soon as it's generated.
     func generateChatSegments(messages: [ChatCompletionRequest.Message], model: String, temperature: Double?, segmentChars: Int = 900, maxSegments: Int = 4, emit: @escaping (String) async -> Void) async throws {
+        await inferenceSemaphore.acquire()
+        defer { Task { await inferenceSemaphore.release() } }
         // Prepare initial prompt within context budget
         let basePrompt = await prepareChatPrompt(messages: messages, model: model, temperature: temperature, maxTokens: nil)
         let tokens = approxTokenCount(basePrompt)

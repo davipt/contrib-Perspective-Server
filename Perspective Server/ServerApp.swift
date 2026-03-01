@@ -8,7 +8,7 @@ struct ServerApp: App {
     var body: some Scene {
         MenuBarExtra("PI Server", systemImage: "bolt.horizontal.circle") {
             VStack(alignment: .leading, spacing: 8) {
-                Text("Perspective Intelligence Server")
+                Text("Perspective Server")
                     .font(.headline)
                 ServerStatusView()
                     .environmentObject(serverController)
@@ -30,6 +30,10 @@ final class ServerController: ObservableObject {
     @Published var isRunning: Bool = false
     @Published var port: UInt16 = 11434
     @Published var errorMessage: String? = nil
+
+    init() {
+        start()
+    }
 
     func start() {
         errorMessage = nil

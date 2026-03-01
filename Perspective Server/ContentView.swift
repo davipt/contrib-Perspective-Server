@@ -1,6 +1,6 @@
 //
 //  ContentView.swift
-//  Perspective Intelligence
+//  Perspective Server
 //
 //  Created by Michael Doise on 9/14/25.
 //

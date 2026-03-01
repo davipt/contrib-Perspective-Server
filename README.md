@@ -1,6 +1,8 @@
-# Perspective Intelligence
+# Perspective Server
 
 A macOS menu bar application that bridges Apple Intelligence (on-device Foundation Models) with OpenAI and Ollama-compatible API endpoints. Run AI locally on your Mac without sending data to external servers.
+
+Built by [Techopolis](https://techopolisonline.com).
 
 ## Features
 
@@ -8,9 +10,13 @@ A macOS menu bar application that bridges Apple Intelligence (on-device Foundati
 - **OpenAI API Compatible**: Drop-in replacement for OpenAI API clients
 - **Ollama API Compatible**: Works with applications that support Ollama
 - **Menu Bar Integration**: Start, stop, and configure the server from your menu bar
-- **Streaming Support**: Server-sent events (SSE) and NDJSON streaming
-- **Tool Calling**: Basic file system tools (read, write, list directory)
-- **Privacy First**: All processing happens on-device
+- **Streaming Support**: True token-by-token streaming via Server-Sent Events (SSE)
+- **Session Management**: Multi-turn conversation context via cached `LanguageModelSession` instances (30-min TTL, up to 50 concurrent sessions)
+- **Guardrail Recovery**: Automatic session eviction on safety violations prevents refusal spirals — a single bad message does not poison the entire conversation
+- **Soft Refusal Detection**: Detects when the model returns a refusal as normal text (not an exception) and resets the session to keep follow-up messages working
+- **Concurrency Control**: Configurable semaphore limits concurrent inference calls (default 3) with FIFO queuing for additional requests
+- **Tool Calling**: File system tools (read, write, edit, delete, move, list directory, create directory, check path)
+- **Privacy First**: All processing happens on-device — no data leaves your Mac
 
 ## Requirements
 
@@ -26,26 +32,34 @@ A macOS menu bar application that bridges Apple Intelligence (on-device Foundati
 1. Clone the repository:
 
 ```bash
-git clone https://github.com/yourusername/Perspective-Intelligence-Server.git
-cd Perspective-Intelligence-Server
+git clone https://github.com/Techopolis/Perspective-Server.git
+cd Perspective-Server
 ```
 
 2. Open the project in Xcode:
 
 ```bash
-open "Perspective Intelligence.xcodeproj"
+open "Perspective Server.xcodeproj"
 ```
 
 3. Select your development team in the project settings under Signing and Capabilities.
 
 4. Build and run the project (Cmd + R).
 
+### Building from Command Line
+
+```bash
+xcodebuild -project "Perspective Server.xcodeproj" -scheme "Perspective Server" -configuration Debug build
+```
+
+The built app will be in `~/Library/Developer/Xcode/DerivedData/`.
+
 ## Getting Started
 
 ### Starting the Server
 
-1. Launch Perspective Intelligence. The app appears in your menu bar with a lightning bolt icon.
-2. The server starts automatically on port 11434 when the app launches.
+1. Launch Perspective Server. The app appears in your menu bar with a lightning bolt icon.
+2. The server starts automatically on port 11435 when the app launches.
 3. Click the menu bar icon to view server status and controls.
 4. The status indicator is green when the server is running.
 5. Use the controls to stop, restart, or change the port if needed.
@@ -55,7 +69,11 @@ open "Perspective Intelligence.xcodeproj"
 You can test the server using curl or any HTTP client:
 
 ```bash
-curl http://127.0.0.1:11434/v1/chat/completions \
+# Health check
+curl http://127.0.0.1:11435/debug/health
+
+# Simple chat completion
+curl http://127.0.0.1:11435/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "apple.local",
@@ -70,22 +88,79 @@ Open Settings (Cmd + ,) to configure:
 - **Include System Prompt**: Toggle whether to send a system instruction with each request
 - **Enable Debug Logging**: Print requests and responses to the console
 - **Include Conversation History**: Send full conversation context or just the latest message
-- **System Prompt**: Customize the AI's behavior with your own instructions
+- **System Prompt**: Customize the AI behavior with your own instructions
+
+## Architecture
+
+### Session Management
+
+The server caches `LanguageModelSession` instances by session ID so multi-turn conversations maintain context across requests. Sessions expire after 30 minutes of inactivity. The cache holds a maximum of 50 sessions — when full, the oldest session is evicted.
+
+Pass a `session_id` in your request to maintain conversation context:
+
+```bash
+curl http://127.0.0.1:11435/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "apple.local",
+    "messages": [{"role": "user", "content": "What did I just ask?"}],
+    "session_id": "my-conversation-123"
+  }'
+```
+
+### Guardrail Recovery
+
+Apple's Foundation Models include built-in safety guardrails. When a guardrail fires (either as a thrown exception or a soft text refusal), the server:
+
+1. Detects the refusal (handles both thrown `GuardrailViolation` errors and text-based refusals like "I can't assist with that")
+2. Evicts the poisoned session from the cache
+3. Creates a fresh session with the same instructions
+4. Returns a friendly message to the user
+
+This prevents the "refusal spiral" where one bad message causes every subsequent message in the conversation to be refused.
+
+### Concurrency Control
+
+The inference semaphore limits how many LLM calls run simultaneously (default: 3). Additional requests wait in a FIFO queue. This prevents memory pressure when multiple users or applications are hitting the server at once.
+
+Check queue status via the health endpoint:
+
+```bash
+curl http://127.0.0.1:11435/debug/health
+```
+
+Returns:
+
+```json
+{
+  "status": "ok",
+  "running": true,
+  "port": 11435,
+  "inference": {
+    "running": 0,
+    "queued": 0,
+    "max_concurrent": 3,
+    "total_completed": 42,
+    "total_queued": 5
+  }
+}
+```
 
 ## API Reference
 
-The server exposes OpenAI and Ollama-compatible endpoints at `http://127.0.0.1:11434` (or your configured port).
+The server exposes OpenAI and Ollama-compatible endpoints at `http://127.0.0.1:11435` (or your configured port).
 
 ### OpenAI-Compatible Endpoints
 
 #### Chat Completions
 
 ```bash
-curl http://127.0.0.1:11434/v1/chat/completions \
+curl http://127.0.0.1:11435/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "apple.local",
     "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
       {"role": "user", "content": "Hello, how are you?"}
     ]
   }'
@@ -94,7 +169,7 @@ curl http://127.0.0.1:11434/v1/chat/completions \
 #### Chat Completions with Streaming
 
 ```bash
-curl http://127.0.0.1:11434/v1/chat/completions \
+curl http://127.0.0.1:11435/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "apple.local",
@@ -108,7 +183,7 @@ curl http://127.0.0.1:11434/v1/chat/completions \
 #### Text Completions
 
 ```bash
-curl http://127.0.0.1:11434/v1/completions \
+curl http://127.0.0.1:11435/v1/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "apple.local",
@@ -119,13 +194,13 @@ curl http://127.0.0.1:11434/v1/completions \
 #### List Models
 
 ```bash
-curl http://127.0.0.1:11434/v1/models
+curl http://127.0.0.1:11435/v1/models
 ```
 
 #### Get Model Details
 
 ```bash
-curl http://127.0.0.1:11434/v1/models/apple.local
+curl http://127.0.0.1:11435/v1/models/apple.local
 ```
 
 ### Ollama-Compatible Endpoints
@@ -133,7 +208,7 @@ curl http://127.0.0.1:11434/v1/models/apple.local
 #### Chat
 
 ```bash
-curl http://127.0.0.1:11434/api/chat \
+curl http://127.0.0.1:11435/api/chat \
   -H "Content-Type: application/json" \
   -d '{
     "model": "apple.local",
@@ -146,7 +221,7 @@ curl http://127.0.0.1:11434/api/chat \
 #### Generate
 
 ```bash
-curl http://127.0.0.1:11434/api/generate \
+curl http://127.0.0.1:11435/api/generate \
   -H "Content-Type: application/json" \
   -d '{
     "model": "apple.local",
@@ -157,13 +232,13 @@ curl http://127.0.0.1:11434/api/generate \
 #### List Tags (Models)
 
 ```bash
-curl http://127.0.0.1:11434/api/tags
+curl http://127.0.0.1:11435/api/tags
 ```
 
 #### Version
 
 ```bash
-curl http://127.0.0.1:11434/api/version
+curl http://127.0.0.1:11435/api/version
 ```
 
 ### Debug Endpoints
@@ -171,13 +246,13 @@ curl http://127.0.0.1:11434/api/version
 #### Health Check
 
 ```bash
-curl http://127.0.0.1:11434/debug/health
+curl http://127.0.0.1:11435/debug/health
 ```
 
 #### Echo (for debugging requests)
 
 ```bash
-curl -X POST http://127.0.0.1:11434/debug/echo \
+curl -X POST http://127.0.0.1:11435/debug/echo \
   -H "Content-Type: application/json" \
   -d '{"test": "data"}'
 ```
@@ -186,11 +261,11 @@ curl -X POST http://127.0.0.1:11434/debug/echo \
 
 ### Xcode 26 Intelligence Mode
 
-Xcode 26 introduces Intelligence Mode, an AI-powered assistant with Agent Mode that provides context-aware code suggestions. You can configure Xcode to use Perspective Intelligence as a locally hosted model provider since it implements the Ollama-compatible API that Xcode expects.
+Xcode 26 introduces Intelligence Mode, an AI-powered assistant with Agent Mode that provides context-aware code suggestions. You can configure Xcode to use Perspective Server as a locally hosted model provider since it implements the Ollama-compatible API that Xcode expects.
 
 #### Setup Instructions
 
-1. Launch Perspective Intelligence and ensure the server is running (green status indicator in menu bar).
+1. Launch Perspective Server and ensure the server is running (green status indicator in menu bar).
 
 2. Open Xcode 26 and go to **Xcode > Settings** (or press Cmd + ,).
 
@@ -202,8 +277,8 @@ Xcode 26 introduces Intelligence Mode, an AI-powered assistant with Agent Mode t
 
 | Setting | Value |
 |---------|-------|
-| Port | 11434 (or your configured port) |
-| Description | Perspective Intelligence |
+| Port | 11435 (or your configured port) |
+| Description | Perspective Server |
 
 6. Click **Add** to save the configuration.
 
@@ -211,7 +286,7 @@ Xcode 26 introduces Intelligence Mode, an AI-powered assistant with Agent Mode t
 
 8. Select **apple.local:latest** as your active model.
 
-**Important**: If you have Ollama running, you must stop it first since both applications use port 11434 by default. Either stop Ollama or change the Perspective Intelligence port in the menu bar settings.
+**Important**: If you have Ollama running on port 11434, there is no conflict since Perspective Server defaults to port 11435. If you changed the port, make sure it matches your Xcode configuration.
 
 #### Using Intelligence Mode
 
@@ -221,7 +296,7 @@ Once configured, you can access Intelligence Mode in Xcode:
 - Use Agent Mode to get context-aware suggestions based on your project
 - The AI can assist with code generation, refactoring, and explanations
 
-#### Benefits of Using Perspective Intelligence with Xcode
+#### Benefits of Using Perspective Server with Xcode
 
 - **Privacy**: All processing happens on-device using Apple Intelligence
 - **No API Costs**: Unlike cloud-hosted models, there are no usage fees
@@ -230,18 +305,18 @@ Once configured, you can access Intelligence Mode in Xcode:
 
 #### Troubleshooting Xcode Integration
 
-If the model doesn't appear in Xcode:
+If the model does not appear in Xcode:
 
-1. Verify Perspective Intelligence server is running (check the menu bar icon)
-2. Confirm the port number matches your server configuration (default is 11434)
-3. Make sure no other service like Ollama is using the same port
+1. Verify Perspective Server is running (check the menu bar icon)
+2. Confirm the port number matches your server configuration (default is 11435)
+3. Make sure no other service is using the same port
 4. Restart Xcode after adding the model provider
 5. Check that Apple Intelligence is enabled on your Mac in System Settings
 
 You can verify the server is working by running this command in Terminal:
 
 ```bash
-curl http://127.0.0.1:11434/api/tags
+curl http://127.0.0.1:11435/api/tags
 ```
 
 You should see a response containing `apple.local:latest` in the models list.
@@ -272,7 +347,7 @@ For comparison, you can also configure cloud-hosted models in Xcode 26 Intellige
 
 Visit [OpenRouter.ai](https://openrouter.ai) to get an API key that provides access to models from Anthropic, OpenAI, Google, and others through a single endpoint.
 
-However, Perspective Intelligence offers the advantage of completely local, private AI assistance without requiring API keys or incurring usage costs.
+However, Perspective Server offers the advantage of completely local, private AI assistance without requiring API keys or incurring usage costs.
 
 ### Cursor IDE
 
@@ -280,7 +355,7 @@ Configure Cursor to use the local server:
 
 1. Open Cursor Settings
 2. Navigate to AI settings
-3. Set the API base URL to `http://127.0.0.1:11434/v1`
+3. Set the API base URL to `http://127.0.0.1:11435/v1`
 4. Use `apple.local` as the model name
 
 ### Continue.dev
@@ -291,10 +366,10 @@ Add to your Continue configuration:
 {
   "models": [
     {
-      "title": "Apple Intelligence",
+      "title": "Apple Intelligence (Perspective Server)",
       "provider": "openai",
       "model": "apple.local",
-      "apiBase": "http://127.0.0.1:11434/v1"
+      "apiBase": "http://127.0.0.1:11435/v1"
     }
   ]
 }
@@ -302,21 +377,26 @@ Add to your Continue configuration:
 
 ### Other OpenAI-Compatible Clients
 
-Any application that supports custom OpenAI API endpoints can use Perspective Intelligence:
+Any application that supports custom OpenAI API endpoints can use Perspective Server:
 
-- Set the API base URL to `http://127.0.0.1:11434/v1`
+- Set the API base URL to `http://127.0.0.1:11435/v1`
 - Use `apple.local` as the model name
 - API key is not required (but can be set to any value if the client requires it)
 
 ## Tool Calling
 
-The server supports basic tool calling for file operations within a sandboxed workspace:
+The server supports tool calling for file operations within a sandboxed workspace:
 
 ### Available Tools
 
 - `read_file`: Read file contents
-- `write_file`: Write content to a file
-- `list_dir`: List directory contents
+- `write_file`: Create or write content to a file
+- `edit_file`: Modify a file by replacing text
+- `delete_file`: Remove a file
+- `move_file`: Move or rename a file
+- `list_directory`: List directory contents
+- `create_directory`: Create new directories
+- `check_path`: Check if a path exists and get its type
 
 ### Workspace Configuration
 
@@ -333,13 +413,28 @@ export PI_WORKSPACE_ROOT=/path/to/your/workspace
 | `PI_WORKSPACE_ROOT` | Root directory for tool file operations | `~/Documents` |
 | `PI_DEBUG_FULL_LOG` | Set to `1` to enable full request body logging | Disabled |
 
+## Source Files
+
+| File | Description |
+|------|-------------|
+| `FoundationModelsService.swift` | Core AI service — bridges OpenAI requests to Apple Foundation Models, manages sessions, handles guardrails |
+| `LocalHTTPServer.swift` | HTTP server with OpenAI and Ollama-compatible routes, SSE streaming |
+| `ServerApp.swift` | Server controller — start, stop, port management |
+| `FileTools.swift` | File system tool implementations for tool calling |
+| `ChatView.swift` | Built-in chat interface |
+| `ChatCommands.swift` | macOS menu commands |
+| `MenuBarContentView.swift` | Menu bar popover UI |
+| `ServerDashboardView.swift` | Server status dashboard |
+| `SettingsView.swift` | App settings UI |
+| `ContentView.swift` | Main content view |
+
 ## Troubleshooting
 
-### Server won't start
+### Server will not start
 
-- Ensure you're running macOS 26.0 (Tahoe) or later on Apple Silicon
+- Ensure you are running macOS 26.0 (Tahoe) or later on Apple Silicon
 - Check that Apple Intelligence is enabled in System Settings
-- Verify the port isn't already in use by another application
+- Verify the port is not already in use by another application
 
 ### Model not available
 
@@ -355,17 +450,21 @@ The server returns a fallback response when:
 
 - Apple Intelligence is not available on your device
 - The on-device model is still downloading
-- Safety guardrails block the request
+- Safety guardrails block the request (the session is automatically reset for next message)
 
 Check the console logs (enable Debug Logging in Settings) for more details.
 
+### Refusal spiral
+
+If every message in a conversation gets refused after a single guardrail hit, the session eviction may not be working. Check the server logs for `[fm-stream] Soft refusal detected` or `[fm-stream] Guardrail violation` messages. Restarting the server clears all cached sessions.
+
 ### Port conflicts
 
-If port 11434 is in use (e.g., by Ollama), change the port in the menu bar controls before starting the server.
+Perspective Server defaults to port 11435. If you need to use a different port, change it in the menu bar controls before starting the server.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome. Please feel free to submit a Pull Request.
 
 1. Fork the repository
 2. Create your feature branch (`git checkout -b feature/amazing-feature`)
@@ -375,7 +474,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-This project is open source. See the LICENSE file for details.
+This project is proprietary software owned by Techopolis. All rights reserved.
 
 ## Acknowledgments
 

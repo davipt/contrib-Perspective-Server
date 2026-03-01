@@ -1,6 +1,6 @@
 //
 //  MenuBarContentView.swift
-//  Perspective Intelligence
+//  Perspective Server
 //
 //  Created by GitHub Copilot on 9/14/25.
 //
@@ -16,8 +16,15 @@ struct MenuBarContentView: View {
             ServerStatusView()
                 .environmentObject(serverController)
             Divider()
+            Button("Open Dashboard") {
+                openWindow(id: "dashboard")
+            }
             Button("Open Chat Window") {
                 openWindow(id: "chat")
+            }
+            Divider()
+            Button("Quit Perspective Server") {
+                NSApplication.shared.terminate(nil)
             }
         }
         .padding(12)

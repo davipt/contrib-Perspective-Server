@@ -1,6 +1,6 @@
 //
 //  SettingsView.swift
-//  Perspective Intelligence
+//  Perspective Server
 //
 //  Created by GitHub Copilot on 9/14/25.
 //
