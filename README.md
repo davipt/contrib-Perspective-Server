@@ -16,6 +16,7 @@ Built by [Techopolis](https://techopolisonline.com).
 - **Soft Refusal Detection**: Detects when the model returns a refusal as normal text (not an exception) and resets the session to keep follow-up messages working
 - **Concurrency Control**: Configurable semaphore limits concurrent inference calls (default 3) with FIFO queuing for additional requests
 - **Tool Calling**: File system tools (read, write, edit, delete, move, list directory, create directory, check path)
+- **Auto-Updates**: Sparkle 2 checks for updates daily and shows a dock badge when one is available
 - **Privacy First**: All processing happens on-device — no data leaves your Mac
 
 ## Requirements
@@ -26,6 +27,16 @@ Built by [Techopolis](https://techopolisonline.com).
 - Xcode 26.0 or later (for building from source)
 
 ## Installation
+
+### Download
+
+Download the latest release from the [Releases page](https://github.com/Techopolis/Perspective-Server/releases).
+
+1. Download `PerspectiveServer-X.X.zip` from the latest release
+2. Unzip and move `Perspective Server.app` to `/Applications`
+3. Launch from Applications — the server starts automatically
+
+The app is signed with Developer ID and notarized by Apple, so it will pass Gatekeeper without issues. Sparkle auto-updater checks for new versions daily and notifies you when an update is available.
 
 ### Building from Source
 
