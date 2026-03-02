@@ -132,10 +132,11 @@ struct ServerStatusView: View {
                     server.port = localPort
                     if server.isRunning { server.restart() } else { server.start() }
                 }
-                Button("Stop") {
-                    server.stop()
+                if server.isRunning {
+                    Button("Stop") {
+                        server.stop()
+                    }
                 }
-                .disabled(!server.isRunning)
             }
             HStack(spacing: 6) {
                 Text("Port:")
@@ -143,6 +144,7 @@ struct ServerStatusView: View {
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 90)
             }
+            Divider()
             Text("OpenAI-compatible endpoints:\nPOST /v1/chat/completions\nPOST /v1/completions\nPOST /api/generate\nGET /v1/models\nGET /v1/models/{id}\nGET /api/models\nGET /api/models/{id}\nGET /api/tags\nGET /api/version\nGET /api/ps\nPOST /api/chat")
                 .font(.footnote)
                 .foregroundStyle(.secondary)

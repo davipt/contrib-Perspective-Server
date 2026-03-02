@@ -154,10 +154,10 @@ struct ChatView: View {
                 .fill(serverStatusColor)
                 .frame(width: 10, height: 10)
                 .accessibilityHidden(true)
-            Text(serverReady ? "Local API: 127.0.0.1:\(vm.port)" : "Server offline")
+            Text(serverReady ? "Local API: 127.0.0.1:\(String(vm.port))" : "Server offline")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
-                .accessibilityLabel(serverReady ? "Local API on port \(vm.port)" : "Server offline")
+                .accessibilityLabel(serverReady ? "Local API on port \(String(vm.port))" : "Server offline")
             Spacer()
             if includeSystemPrompt && !systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 Text("System Prompt On")
