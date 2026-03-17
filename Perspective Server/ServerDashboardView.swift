@@ -200,7 +200,7 @@ struct ServerDashboardView: View {
                             .foregroundColor(.primary)
                         
                         if serverController.isRunning {
-                            Text("Listening on port \(serverController.port)")
+                            Text("Listening on port \(String(serverController.port))")
                                 .font(.subheadline)
                                 .foregroundColor(.secondary)
                         } else if let error = serverController.errorMessage {
@@ -218,12 +218,12 @@ struct ServerDashboardView: View {
                 
                 if serverController.isRunning {
                     HStack(spacing: 8) {
-                        Label("http://127.0.0.1:\(serverController.port)", systemImage: "link")
+                        Label("http://127.0.0.1:\(String(serverController.port))", systemImage: "link")
                             .font(.system(size: 13, design: .monospaced))
                             .foregroundColor(.accentColor)
                         
                         Button(action: {
-                            copyToClipboard("http://127.0.0.1:\(serverController.port)", message: "Base URL copied")
+                            copyToClipboard("http://127.0.0.1:\(String(serverController.port))", message: "Base URL copied")
                         }) {
                             Image(systemName: "doc.on.doc")
                                 .font(.caption)
@@ -247,7 +247,7 @@ struct ServerDashboardView: View {
                         serverController.port = portNum
                     }
                     serverController.start()
-                    addLog("Server started on port \(serverController.port)", type: .success)
+                    addLog("Server started on port \(String(serverController.port))", type: .success)
                 }
             }) {
                 VStack(spacing: 8) {
@@ -389,6 +389,20 @@ struct ServerDashboardView: View {
                         .accessibilityLabel(serverController.isRunning ? "Restart server with new port" : "Start server")
                     }
                 }
+            }
+            HStack {
+                Toggle(isOn: $autoStart) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Auto Start Server")
+                            .font(.subheadline.weight(.medium))
+                        Text("Start server automatically on app launch")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+                .accessibilityLabel("Auto start server")
+                .accessibilityHint("Toggle to start the server automatically when the app launches")
             }
             
             // Model info
@@ -538,7 +552,7 @@ struct ServerDashboardView: View {
                 Spacer()
                 
                 Button(action: {
-                    copyToClipboard("http://127.0.0.1:\(serverController.port)/v1", message: "OpenAI base URL copied")
+                    copyToClipboard("http://127.0.0.1:\(String(serverController.port))/v1", message: "OpenAI base URL copied")
                 }) {
                     HStack(spacing: 4) {
                         Image(systemName: "doc.on.doc")
@@ -595,7 +609,7 @@ struct ServerDashboardView: View {
             Spacer()
             
             Button(action: {
-                copyToClipboard("http://127.0.0.1:\(serverController.port)\(path)", message: "Endpoint copied")
+                copyToClipboard("http://127.0.0.1:\(String(serverController.port))\(path)", message: "Endpoint copied")
             }) {
                 Image(systemName: "doc.on.doc")
                     .font(.caption2)
@@ -628,23 +642,45 @@ struct ServerDashboardView: View {
                     subtitle: "Test command",
                     icon: "terminal",
                     action: {
-                        let cmd = "curl http://127.0.0.1:\(serverController.port)/api/tags"
+                        let cmd = "curl http://127.0.0.1:\(String(serverController.port))/api/tags"
                         copyToClipboard(cmd, message: "cURL command copied")
                     }
                 )
                 
-                actionButton(
-                    title: "Settings",
-                    subtitle: "Preferences",
-                    icon: "gearshape",
-                    action: {
-                        if #available(macOS 14.0, *) {
-                            NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-                        } else {
+                if #available(macOS 14.0, *) {
+                    SettingsLink {
+                        VStack(spacing: 6) {
+                            Image(systemName: "gearshape")
+                                .font(.title2)
+                                .accessibilityHidden(true)
+                            Text("Settings")
+                                .font(.subheadline.weight(.medium))
+                            Text("Preferences")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        .foregroundColor(.primary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 16)
+                        .background(Color(NSColor.textBackgroundColor))
+                        .cornerRadius(12)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(Color(NSColor.separatorColor), lineWidth: 1)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Settings, Preferences")
+                } else {
+                    actionButton(
+                        title: "Settings",
+                        subtitle: "Preferences",
+                        icon: "gearshape",
+                        action: {
                             NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
                         }
-                    }
-                )
+                    )
+                }
                 
                 actionButton(
                     title: "Chat",
@@ -660,6 +696,7 @@ struct ServerDashboardView: View {
                     subtitle: "README",
                     icon: "book",
                     action: {
+                        // FIXME replace with proper docs URL
                         if let url = URL(string: "https://github.com") {
                             NSWorkspace.shared.open(url)
                         }
@@ -766,6 +803,7 @@ struct ServerDashboardView: View {
             RoundedRectangle(cornerRadius: 16)
                 .stroke(Color(NSColor.separatorColor), lineWidth: 1)
         )
+        .onAppear(perform: syncServerState)
     }
     
     // MARK: - Server Stats Card
@@ -884,9 +922,17 @@ struct ServerDashboardView: View {
 
     private func syncServerState() {
         Task {
-            let running = await LocalHTTPServer.shared.getIsRunning()
+            var running = await LocalHTTPServer.shared.getIsRunning()
             let port = await LocalHTTPServer.shared.getPort()
             await MainActor.run {
+                if !running && autoStart {
+                    if let portNum = UInt16(localPort) {
+                        serverController.port = portNum
+                    }
+                    serverController.start()
+                    addLog("Server started on port \(String(serverController.port))", type: .success)
+                    running = true;
+                }
                 serverController.isRunning = running
                 serverController.port = port
                 localPort = String(port)
@@ -910,7 +956,7 @@ struct ServerDashboardView: View {
         testResult = ""
         
         Task {
-            let url = URL(string: "http://127.0.0.1:\(serverController.port)/api/tags")!
+            let url = URL(string: "http://127.0.0.1:\(String(serverController.port))/api/tags")!
             do {
                 let (data, response) = try await URLSession.shared.data(from: url)
                 

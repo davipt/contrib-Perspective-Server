@@ -125,9 +125,11 @@ actor LocalHTTPServer {
         // Basic request logging for troubleshooting
     let contentType = request.headers["content-type"] ?? request.headers["Content-Type"] ?? ""
     let contentLength = request.headers["content-length"] ?? request.headers["Content-Length"] ?? ""
-        logger.log("[req:\(rid, privacy: .public)] HTTP \(request.method, privacy: .public) \(path, privacy: .public) ct=\(contentType, privacy: .public) cl=\(contentLength, privacy: .public)")
         if request.method == "POST" {
+            logger.log("[req:\(rid, privacy: .public)] HTTP \(request.method, privacy: .public) \(path, privacy: .public) ct=\(contentType, privacy: .public) cl=\(contentLength, privacy: .public)")
             logger.log("[req:\(rid, privacy: .public)] body: \(Self.truncateBodyForLog(request.bodyData), privacy: .public)")
+        } else {
+            logger.log("[req:\(rid, privacy: .public)] HTTP \(request.method, privacy: .public) \(path, privacy: .public)")
         }
 
         // Route GET /v1/models (list)
@@ -648,11 +650,10 @@ actor LocalHTTPServer {
             lastError = nil
         case .failed(let error):
             let isAddressInUse: Bool
-            if let posixError = error as? NWError,
-               case .posix(let code) = posixError,
-               code == .EADDRINUSE {
+            switch error {
+            case .posix(let code) where code == .EADDRINUSE:
                 isAddressInUse = true
-            } else {
+            default:
                 isAddressInUse = false
             }
             

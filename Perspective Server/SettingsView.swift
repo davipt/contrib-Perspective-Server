@@ -8,7 +8,9 @@
 import SwiftUI
 
 struct SettingsView: View {
-    @AppStorage("systemPrompt") private var systemPrompt: String = "You are a helpful assistant. Keep responses concise and relevant."
+    static let DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant. Keep responses concise and relevant."
+    
+    @AppStorage("systemPrompt") private var systemPrompt: String = SettingsView.DEFAULT_SYSTEM_PROMPT
     @AppStorage("includeSystemPrompt") private var includeSystemPrompt: Bool = false
     @AppStorage("debugLogging") private var debugLogging: Bool = false
     @AppStorage("includeHistory") private var includeHistory: Bool = true
@@ -29,6 +31,7 @@ struct SettingsView: View {
                 .accessibilityLabel("Receive beta updates")
                 .accessibilityHint("Get early access to new features before stable release")
 
+            Spacer()
             Section(header: Text("System Prompt")) {
                 TextEditor(text: $systemPrompt)
                     .frame(minHeight: 120)
@@ -38,7 +41,7 @@ struct SettingsView: View {
                 HStack {
                     Spacer()
                     Button("Reset to Default") {
-                        systemPrompt = "You are a helpful assistant. Keep responses concise and relevant."
+                        systemPrompt = SettingsView.DEFAULT_SYSTEM_PROMPT
                         includeSystemPrompt = true
                     }
                 }
