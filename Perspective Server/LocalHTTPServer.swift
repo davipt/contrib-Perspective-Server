@@ -19,6 +19,25 @@ actor LocalHTTPServer {
     private var portsToTry: [UInt16] = []
     private var currentPortIndex: Int = 0
 
+    // MARK: - Security
+
+    /// Bearer token required for all non-preflight requests
+    private var authToken: String?
+
+    private static let tokenDirectory: URL = {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return appSupport.appendingPathComponent("Perspective Server")
+    }()
+
+    static let tokenFileURL: URL = {
+        tokenDirectory.appendingPathComponent("auth_token")
+    }()
+
+    /// Hosts allowed to make cross-origin requests
+    private static let allowedOriginHosts: Set<String> = [
+        "localhost", "127.0.0.1", "[::1]", "::1"
+    ]
+
     private init() {}
 
     func incrementActiveRequests() -> Int {
@@ -35,6 +54,71 @@ actor LocalHTTPServer {
         activeRequestCount
     }
 
+    // MARK: - Security helpers
+
+    /// Generate a cryptographic auth token and write it to disk.
+    /// Local applications can read the file; web pages cannot.
+    private func generateAndStoreToken() throws {
+        let token = UUID().uuidString
+        authToken = nil
+
+        let fm = FileManager.default
+        try fm.createDirectory(at: Self.tokenDirectory, withIntermediateDirectories: true)
+        try token.write(to: Self.tokenFileURL, atomically: true, encoding: .utf8)
+        // Restrict file permissions to owner-only (0600)
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.tokenFileURL.path)
+
+        let persistedToken = try String(contentsOf: Self.tokenFileURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard persistedToken == token else {
+            throw NSError(
+                domain: "LocalHTTPServer",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Persisted auth token did not match generated token"]
+            )
+        }
+
+        authToken = token
+
+        logger.log("Auth token written to \(Self.tokenFileURL.path, privacy: .public)")
+    }
+
+    /// Validate Host header to prevent DNS rebinding attacks.
+    nonisolated private static func isAllowedHost(_ host: String?, serverPort: UInt16) -> Bool {
+        guard let host = host else { return true } // No Host header = direct TCP, not from browser
+        let lowered = host.lowercased()
+        let allowed = [
+            "localhost:\(serverPort)",
+            "127.0.0.1:\(serverPort)",
+            "[::1]:\(serverPort)",
+            "localhost",
+            "127.0.0.1",
+            "[::1]"
+        ]
+        return allowed.contains(lowered)
+    }
+
+    /// Check if an Origin header value is in the allowlist by parsing the URL host.
+    nonisolated private static func isAllowedOrigin(_ origin: String?) -> Bool {
+        guard let origin = origin else { return true } // No Origin = not a browser cross-origin request
+        guard let url = URL(string: origin), let host = url.host else { return false }
+        return allowedOriginHosts.contains(host.lowercased())
+    }
+
+    nonisolated private static func jsonHeaders(corsOrigin: String? = nil) -> [String: String] {
+        var headers = ["Content-Type": "application/json"]
+        if let corsOrigin, !corsOrigin.isEmpty {
+            headers["Access-Control-Allow-Origin"] = corsOrigin
+            headers["Vary"] = "Origin"
+        }
+        return headers
+    }
+
+    /// Return the current auth token (for UI display / copy-to-clipboard).
+    func getAuthToken() -> String? {
+        authToken
+    }
+
     // MARK: Lifecycle
 
     func start() async {
@@ -43,6 +127,14 @@ actor LocalHTTPServer {
             return
         }
         lastError = nil
+        do {
+            try generateAndStoreToken()
+        } catch {
+            authToken = nil
+            lastError = "Failed to persist auth token: \(error.localizedDescription)"
+            logger.error("\(self.lastError ?? "")")
+            return
+        }
         // Build port list: configured port first, then fallbacks (deduped)
         portsToTry = [port] + fallbackPorts.filter { $0 != port }
         currentPortIndex = 0
@@ -62,6 +154,7 @@ actor LocalHTTPServer {
         
         do {
             let params = NWParameters.tcp
+            params.requiredInterfaceType = .loopback
             listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: targetPort)!)
             listener?.stateUpdateHandler = { [weak self] state in
                 guard let self else { return }
@@ -102,14 +195,52 @@ actor LocalHTTPServer {
 
         await ServerMetrics.shared.recordRequest()
 
-        // CORS preflight support
+        // --- Security layer ---
+
+        // 1. Validate Host header (DNS rebinding protection)
+        let serverPort = await self.port
+        let host = request.headers["host"]
+        let origin = request.headers["origin"]
+        let validatedCorsOrigin = Self.isAllowedOrigin(origin) ? (origin ?? "") : ""
+        if !Self.isAllowedHost(host, serverPort: serverPort) {
+            logger.warning("[req:\(rid, privacy: .public)] Blocked: invalid Host header '\(host ?? "nil", privacy: .public)'")
+            let msg = ["error": ["message": "Forbidden: invalid Host header"]]
+            let data = (try? JSONSerialization.data(withJSONObject: msg, options: [])) ?? Data()
+            return .normal(HTTPResponse(status: 403, headers: Self.jsonHeaders(corsOrigin: validatedCorsOrigin), body: data))
+        }
+
+        // 2. Validate Origin header (cross-origin protection)
+        if !Self.isAllowedOrigin(origin) {
+            logger.warning("[req:\(rid, privacy: .public)] Blocked: disallowed Origin '\(origin ?? "nil", privacy: .public)'")
+            let msg = ["error": ["message": "Forbidden: origin not allowed"]]
+            let data = (try? JSONSerialization.data(withJSONObject: msg, options: [])) ?? Data()
+            return .normal(HTTPResponse(status: 403, headers: Self.jsonHeaders(), body: data))
+        }
+
+        // Compute CORS origin: echo back the validated origin, or empty if no Origin header
+        let corsOrigin = validatedCorsOrigin
+
+        // CORS preflight support (no auth token required for preflight)
         if request.method == "OPTIONS" {
             return .normal(HTTPResponse(status: 204, headers: [
-                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Origin": corsOrigin,
                 "Access-Control-Allow-Methods": "GET, POST, OPTIONS, HEAD",
                 "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
                 "Access-Control-Max-Age": "600"
             ], body: Data()))
+        }
+
+        // 3. Validate Bearer token (authentication)
+        let expectedToken = await self.authToken
+        if let token = expectedToken {
+            let authHeader = request.headers["authorization"] ?? ""
+            let provided = authHeader.hasPrefix("Bearer ") ? String(authHeader.dropFirst(7)) : ""
+            if provided != token {
+                logger.warning("[req:\(rid, privacy: .public)] Blocked: invalid or missing auth token")
+                let msg = ["error": ["message": "Unauthorized: invalid or missing bearer token. Token is stored at \(Self.tokenFileURL.path)"]]
+                let data = (try? JSONSerialization.data(withJSONObject: msg, options: [])) ?? Data()
+                return .normal(HTTPResponse(status: 401, headers: Self.jsonHeaders(corsOrigin: corsOrigin), body: data))
+            }
         }
 
         // Normalize path: strip query string and trailing slash
@@ -137,7 +268,7 @@ actor LocalHTTPServer {
                 let data = try JSONEncoder().encode(models)
                 let resp = HTTPResponse(status: 200, headers: [
                     "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*"
+                    "Access-Control-Allow-Origin": corsOrigin
                 ], body: data)
                 if request.method == "HEAD" { return .normal(HTTPResponse(status: resp.status, headers: resp.headers, body: Data())) }
                 return .normal(resp)
@@ -147,7 +278,7 @@ actor LocalHTTPServer {
                 let data = try? JSONSerialization.data(withJSONObject: msg, options: [])
                 return .normal(HTTPResponse(status: 400, headers: [
                     "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*"
+                    "Access-Control-Allow-Origin": corsOrigin
                 ], body: data ?? Data()))
             }
         }
@@ -183,7 +314,7 @@ actor LocalHTTPServer {
             let data = (try? JSONSerialization.data(withJSONObject: obj, options: [])) ?? Data()
             let resp = HTTPResponse(status: 200, headers: [
                 "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*"
+                "Access-Control-Allow-Origin": corsOrigin
             ], body: data)
             if request.method == "HEAD" { return .normal(HTTPResponse(status: resp.status, headers: resp.headers, body: Data())) }
             return .normal(resp)
@@ -203,7 +334,7 @@ actor LocalHTTPServer {
             let data = (try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted])) ?? Data()
             return .normal(HTTPResponse(status: 200, headers: [
                 "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*"
+                "Access-Control-Allow-Origin": corsOrigin
             ], body: data))
         }
 
@@ -228,7 +359,7 @@ actor LocalHTTPServer {
             let data = (try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted])) ?? Data()
             let resp = HTTPResponse(status: 200, headers: [
                 "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*"
+                "Access-Control-Allow-Origin": corsOrigin
             ], body: data)
             if request.method == "HEAD" { return .normal(HTTPResponse(status: resp.status, headers: resp.headers, body: Data())) }
             return .normal(resp)
@@ -241,7 +372,7 @@ actor LocalHTTPServer {
                 let data = try JSONEncoder().encode(models)
                 let resp = HTTPResponse(status: 200, headers: [
                     "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*"
+                    "Access-Control-Allow-Origin": corsOrigin
                 ], body: data)
                 if request.method == "HEAD" { return .normal(HTTPResponse(status: resp.status, headers: resp.headers, body: Data())) }
                 return .normal(resp)
@@ -251,7 +382,7 @@ actor LocalHTTPServer {
                 let data = try? JSONSerialization.data(withJSONObject: msg, options: [])
                 return .normal(HTTPResponse(status: 400, headers: [
                     "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*"
+                    "Access-Control-Allow-Origin": corsOrigin
                 ], body: data ?? Data()))
             }
         }
@@ -263,7 +394,7 @@ actor LocalHTTPServer {
                 let data = try JSONEncoder().encode(tags)
                 let resp = HTTPResponse(status: 200, headers: [
                     "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*"
+                    "Access-Control-Allow-Origin": corsOrigin
                 ], body: data)
                 if request.method == "HEAD" { return .normal(HTTPResponse(status: resp.status, headers: resp.headers, body: Data())) }
                 return .normal(resp)
@@ -273,7 +404,7 @@ actor LocalHTTPServer {
                 let data = try? JSONSerialization.data(withJSONObject: msg, options: [])
                 return .normal(HTTPResponse(status: 400, headers: [
                     "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*"
+                    "Access-Control-Allow-Origin": corsOrigin
                 ], body: data ?? Data()))
             }
         }
@@ -285,7 +416,7 @@ actor LocalHTTPServer {
             let data = (try? JSONSerialization.data(withJSONObject: obj, options: [])) ?? Data()
             let resp = HTTPResponse(status: 200, headers: [
                 "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*"
+                "Access-Control-Allow-Origin": corsOrigin
             ], body: data)
             if request.method == "HEAD" { return .normal(HTTPResponse(status: resp.status, headers: resp.headers, body: Data())) }
             return .normal(resp)
@@ -296,7 +427,7 @@ actor LocalHTTPServer {
             let data = Data("{\"models\": []}".utf8)
             let resp = HTTPResponse(status: 200, headers: [
                 "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*"
+                "Access-Control-Allow-Origin": corsOrigin
             ], body: data)
             if request.method == "HEAD" { return .normal(HTTPResponse(status: resp.status, headers: resp.headers, body: Data())) }
             return .normal(resp)
@@ -312,7 +443,7 @@ actor LocalHTTPServer {
                 logger.log("[req:\(rid, privacy: .public)] /api/chat ok model=\(respObj.model, privacy: .public) msgLen=\(respObj.message.content.count)")
                 return .normal(HTTPResponse(status: 200, headers: [
                     "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*"
+                    "Access-Control-Allow-Origin": corsOrigin
                 ], body: data))
             } catch {
                 logger.error("[req:\(rid, privacy: .public)] /api/chat error: \(String(describing: error), privacy: .public) body=\(Self.truncateBodyForLog(request.bodyData), privacy: .public)")
@@ -320,7 +451,7 @@ actor LocalHTTPServer {
                 let data = try? JSONSerialization.data(withJSONObject: msg, options: [])
                 return .normal(HTTPResponse(status: 400, headers: [
                     "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*"
+                    "Access-Control-Allow-Origin": corsOrigin
                 ], body: data ?? Data()))
             }
         }
@@ -333,7 +464,7 @@ actor LocalHTTPServer {
                     let data = try JSONEncoder().encode(model)
                     let resp = HTTPResponse(status: 200, headers: [
                         "Content-Type": "application/json",
-                        "Access-Control-Allow-Origin": "*"
+                        "Access-Control-Allow-Origin": corsOrigin
                     ], body: data)
                     if request.method == "HEAD" { return .normal(HTTPResponse(status: resp.status, headers: resp.headers, body: Data())) }
                     return .normal(resp)
@@ -343,7 +474,7 @@ actor LocalHTTPServer {
                     let data = try? JSONSerialization.data(withJSONObject: msg, options: [])
                     return .normal(HTTPResponse(status: 400, headers: [
                         "Content-Type": "application/json",
-                        "Access-Control-Allow-Origin": "*"
+                        "Access-Control-Allow-Origin": corsOrigin
                     ], body: data ?? Data()))
                 }
             } else {
@@ -357,7 +488,7 @@ actor LocalHTTPServer {
                 let data = try? JSONSerialization.data(withJSONObject: msg, options: [])
                 return .normal(HTTPResponse(status: 404, headers: [
                     "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*"
+                    "Access-Control-Allow-Origin": corsOrigin
                 ], body: data ?? Data()))
             }
         }
@@ -370,7 +501,7 @@ actor LocalHTTPServer {
                     let data = try JSONEncoder().encode(model)
                     let resp = HTTPResponse(status: 200, headers: [
                         "Content-Type": "application/json",
-                        "Access-Control-Allow-Origin": "*"
+                        "Access-Control-Allow-Origin": corsOrigin
                     ], body: data)
                     if request.method == "HEAD" { return .normal(HTTPResponse(status: resp.status, headers: resp.headers, body: Data())) }
                     return .normal(resp)
@@ -380,7 +511,7 @@ actor LocalHTTPServer {
                     let data = try? JSONSerialization.data(withJSONObject: msg, options: [])
                     return .normal(HTTPResponse(status: 400, headers: [
                         "Content-Type": "application/json",
-                        "Access-Control-Allow-Origin": "*"
+                        "Access-Control-Allow-Origin": corsOrigin
                     ], body: data ?? Data()))
                 }
             } else {
@@ -394,7 +525,7 @@ actor LocalHTTPServer {
                 let data = try? JSONSerialization.data(withJSONObject: msg, options: [])
                 return .normal(HTTPResponse(status: 404, headers: [
                     "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*"
+                    "Access-Control-Allow-Origin": corsOrigin
                 ], body: data ?? Data()))
             }
         }
@@ -406,7 +537,7 @@ actor LocalHTTPServer {
                 let req = try decoder.decode(TextCompletionRequest.self, from: request.bodyData)
                 if req.stream == true {
                     // Simulate streaming via SSE with small text chunks
-                    return .stream(HTTPStreamResponse.sse(handler: { emitter in
+                    return .stream(HTTPStreamResponse.sse(origin: corsOrigin, handler: { emitter in
                         let resp = try await FoundationModelsService.shared.handleCompletion(req)
                         let full = resp.choices.first?.text ?? ""
                         logger.log("[req:\(rid, privacy: .public)] /v1/completions streaming text len=\(full.count)")
@@ -429,7 +560,7 @@ actor LocalHTTPServer {
                     logger.log("[req:\(rid, privacy: .public)] /v1/completions ok textLen=\(resp.choices.first?.text.count ?? 0)")
                     return .normal(HTTPResponse(status: 200, headers: [
                         "Content-Type": "application/json",
-                        "Access-Control-Allow-Origin": "*"
+                        "Access-Control-Allow-Origin": corsOrigin
                     ], body: data))
                 }
             } catch {
@@ -438,7 +569,7 @@ actor LocalHTTPServer {
                 let data = try? JSONSerialization.data(withJSONObject: msg, options: [])
                 return .normal(HTTPResponse(status: 400, headers: [
                     "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*"
+                    "Access-Control-Allow-Origin": corsOrigin
                 ], body: data ?? Data()))
             }
         }
@@ -450,7 +581,7 @@ actor LocalHTTPServer {
                 let req = try decoder.decode(TextCompletionRequest.self, from: request.bodyData)
                 if req.stream == true {
                     // Ollama style NDJSON streaming with "response" chunks
-                    return .stream(HTTPStreamResponse.ndjson(handler: { emitter in
+                    return .stream(HTTPStreamResponse.ndjson(origin: corsOrigin, handler: { emitter in
                         let resp = try await FoundationModelsService.shared.handleCompletion(req)
                         let full = resp.choices.first?.text ?? ""
                         logger.log("[req:\(rid, privacy: .public)] /api/generate streaming text len=\(full.count)")
@@ -476,7 +607,7 @@ actor LocalHTTPServer {
                     logger.log("[req:\(rid, privacy: .public)] /api/generate ok textLen=\(resp.choices.first?.text.count ?? 0)")
                     return .normal(HTTPResponse(status: 200, headers: [
                         "Content-Type": "application/json",
-                        "Access-Control-Allow-Origin": "*"
+                        "Access-Control-Allow-Origin": corsOrigin
                     ], body: data))
                 }
             } catch {
@@ -485,7 +616,7 @@ actor LocalHTTPServer {
                 let data = try? JSONSerialization.data(withJSONObject: msg, options: [])
                 return .normal(HTTPResponse(status: 400, headers: [
                     "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*"
+                    "Access-Control-Allow-Origin": corsOrigin
                 ], body: data ?? Data()))
             }
         }
@@ -496,7 +627,7 @@ actor LocalHTTPServer {
                 let decoder = JSONDecoder()
                 let req = try decoder.decode(ChatCompletionRequest.self, from: request.bodyData)
                 if req.stream == true {
-                    return .stream(HTTPStreamResponse.sse(handler: { emitter in
+                    return .stream(HTTPStreamResponse.sse(origin: corsOrigin, handler: { emitter in
                         let hasTools: Bool = {
                             if let data = String(data: request.bodyData, encoding: .utf8)?.lowercased() {
                                 return data.contains("\"tools\"") && !data.contains("\"tools\": []")
@@ -616,7 +747,7 @@ actor LocalHTTPServer {
                     logger.log("[req:\(rid, privacy: .public)] /v1/chat/completions ok msgLen=\(resp.choices.first?.message.content.count ?? 0)")
                     return .normal(HTTPResponse(status: 200, headers: [
                         "Content-Type": "application/json",
-                        "Access-Control-Allow-Origin": "*"
+                        "Access-Control-Allow-Origin": corsOrigin
                     ], body: data))
                 }
             } catch {
@@ -625,7 +756,7 @@ actor LocalHTTPServer {
                 let data = try? JSONSerialization.data(withJSONObject: msg, options: [])
                 return .normal(HTTPResponse(status: 400, headers: [
                     "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*"
+                    "Access-Control-Allow-Origin": corsOrigin
                 ], body: data ?? Data()))
             }
         }
@@ -634,7 +765,7 @@ actor LocalHTTPServer {
         let body = Data("Not Found".utf8)
         return .normal(HTTPResponse(status: 404, headers: [
             "Content-Type": "text/plain",
-            "Access-Control-Allow-Origin": "*"
+            "Access-Control-Allow-Origin": corsOrigin
         ], body: body))
     }
 
@@ -643,7 +774,7 @@ actor LocalHTTPServer {
     private func handleListenerState(_ state: NWListener.State, currentPort: UInt16) async {
         switch state {
         case .ready:
-            logger.log("HTTP server listening on 0.0.0.0:\(currentPort)")
+            logger.log("HTTP server listening on localhost:\(currentPort) (loopback only)")
             isRunning = true
             lastError = nil
         case .failed(let error):
@@ -953,9 +1084,11 @@ nonisolated struct HTTPResponse: Sendable {
     private func statusText(_ code: Int) -> String {
         switch code {
         case 200: return "OK"
-        case 400: return "Bad Request"
-        case 404: return "Not Found"
         case 204: return "No Content"
+        case 400: return "Bad Request"
+        case 401: return "Unauthorized"
+        case 403: return "Forbidden"
+        case 404: return "Not Found"
         default: return "OK"
         }
     }
@@ -979,21 +1112,21 @@ nonisolated final class HTTPStreamResponse: @unchecked Sendable {
         self.runner = runner
     }
 
-    static func sse(handler: @escaping (Emitter) async throws -> Void) -> HTTPStreamResponse {
+    static func sse(origin: String, handler: @escaping (Emitter) async throws -> Void) -> HTTPStreamResponse {
         return HTTPStreamResponse(headers: [
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
-            "Access-Control-Allow-Origin": "*"
+            "Access-Control-Allow-Origin": origin
         ]) { emitter in
             try? await handler(emitter)
         }
     }
 
-    static func ndjson(handler: @escaping (Emitter) async throws -> Void) -> HTTPStreamResponse {
+    static func ndjson(origin: String, handler: @escaping (Emitter) async throws -> Void) -> HTTPStreamResponse {
         return HTTPStreamResponse(headers: [
             "Content-Type": "application/x-ndjson",
             "Cache-Control": "no-cache",
-            "Access-Control-Allow-Origin": "*"
+            "Access-Control-Allow-Origin": origin
         ]) { emitter in
             try? await handler(emitter)
         }
@@ -1069,4 +1202,3 @@ nonisolated enum HTTPRequestParser: Sendable {
         return HTTPRequest(method: method, path: path, headers: headers, bodyData: bodyData)
     }
 }
-

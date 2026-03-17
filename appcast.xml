@@ -4,24 +4,28 @@
         <title>Perspective Server Updates</title>
         <language>en</language>
         <item>
-            <title>Version 1.1.0 Beta 1</title>
-            <pubDate>Thu, 13 Mar 2026 12:00:00 +0000</pubDate>
+            <title>Version 1.1.0 Beta 2</title>
+            <pubDate>Tue, 17 Mar 2026 20:57:03 +0000</pubDate>
             <sparkle:version>2</sparkle:version>
-            <sparkle:shortVersionString>1.1.0-beta.1</sparkle:shortVersionString>
+            <sparkle:shortVersionString>1.1.0-beta.2</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
             <sparkle:channel>beta</sparkle:channel>
             <description><![CDATA[
-                <h2>Perspective Server 1.1.0 Beta 1</h2>
+                <h2>Perspective Server 1.1.0 Beta 2</h2>
+                <p>This beta is a targeted security release for GitHub issue #1, <strong>[Bug] Open web server manipulable by any web page</strong>. It is intended to close that localhost exposure and stabilize the affected client flows.</p>
                 <ul>
-                    <li>Server metrics dashboard with request counts, token tracking, and time-to-first-token</li>
-                    <li>Opt-in beta update channel in Settings</li>
-                    <li>Swift 6.2 concurrency fixes</li>
+                    <li>Restricts the local server to loopback access while preserving both IPv4 and IPv6 localhost connectivity</li>
+                    <li>Adds bearer-token protection for local clients and repairs the in-app chat, dashboard test, and copied client setup flows to work with that requirement</li>
+                    <li>Returns readable auth failures to localhost web clients so browser-based integrations see proper 401 responses instead of opaque CORS errors</li>
+                    <li>Fails startup if the auth token cannot be safely persisted, avoiding an unrecoverable local auth state</li>
                 </ul>
+                <p>Security issue reported by Brian Sniffen.</p>
             ]]></description>
             <enclosure
-                url="https://github.com/Techopolis/Perspective-Server/releases/download/v1.1.0-beta.1/PerspectiveServer-1.1.0-beta.1.zip"
+                url="https://github.com/Techopolis/Perspective-Server/releases/download/v1.1.0-beta.2/PerspectiveServer-1.1.0-beta.2.zip"
                 type="application/octet-stream"
-                length="1570645"
+                sparkle:edSignature="HeSDe+wqEK/edVCaZWq7NxrvLQT6OwqVUITSCX7t5YP+zlb/403arHRn6PkRQOg9JD6uuji5Tk3HkvpZiPrQDA=="
+                length="1892226"
             />
         </item>
         <item>

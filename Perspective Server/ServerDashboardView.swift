@@ -223,14 +223,19 @@ struct ServerDashboardView: View {
                             .foregroundColor(.accentColor)
                         
                         Button(action: {
-                            copyToClipboard("http://127.0.0.1:\(serverController.port)", message: "Base URL copied")
+                            copyToClipboard(
+                                authenticatedEndpointDetails(path: "", includeOpenAIBaseURL: false),
+                                message: "Base URL details copied"
+                            )
                         }) {
                             Image(systemName: "doc.on.doc")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel("Copy base URL")
+                        .accessibilityLabel(copiedAccessibilityLabel(defaultLabel: "Copy base URL", copiedLabel: "Base URL copied", copiedMessage: "Base URL details copied"))
+                        .accessibilityValue(copiedAccessibilityValue(copiedMessage: "Base URL details copied"))
+                        .accessibilityHint("Copies the base URL details to the clipboard")
                     }
                 }
             }
@@ -538,7 +543,10 @@ struct ServerDashboardView: View {
                 Spacer()
                 
                 Button(action: {
-                    copyToClipboard("http://127.0.0.1:\(serverController.port)/v1", message: "OpenAI base URL copied")
+                    copyToClipboard(
+                        authenticatedEndpointDetails(path: "/v1", includeOpenAIBaseURL: true),
+                        message: "OpenAI setup details copied"
+                    )
                 }) {
                     HStack(spacing: 4) {
                         Image(systemName: "doc.on.doc")
@@ -549,7 +557,9 @@ struct ServerDashboardView: View {
                     .foregroundColor(.accentColor)
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Copy OpenAI base URL")
+                .accessibilityLabel(copiedAccessibilityLabel(defaultLabel: "Copy OpenAI base URL", copiedLabel: "OpenAI base URL copied", copiedMessage: "OpenAI setup details copied"))
+                .accessibilityValue(copiedAccessibilityValue(copiedMessage: "OpenAI setup details copied"))
+                .accessibilityHint("Copies the OpenAI base URL details and bearer token to the clipboard")
             }
             
             Divider()
@@ -595,14 +605,19 @@ struct ServerDashboardView: View {
             Spacer()
             
             Button(action: {
-                copyToClipboard("http://127.0.0.1:\(serverController.port)\(path)", message: "Endpoint copied")
+                copyToClipboard(
+                    authenticatedEndpointDetails(path: path),
+                    message: "Endpoint details copied"
+                )
             }) {
                 Image(systemName: "doc.on.doc")
                     .font(.caption2)
                     .foregroundColor(.secondary)
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Copy endpoint URL")
+            .accessibilityLabel(copiedAccessibilityLabel(defaultLabel: "Copy endpoint URL", copiedLabel: "Endpoint copied", copiedMessage: "Endpoint details copied"))
+            .accessibilityValue(copiedAccessibilityValue(copiedMessage: "Endpoint details copied"))
+            .accessibilityHint("Copies the endpoint details and bearer token to the clipboard")
         }
         .padding(.vertical, 4)
         .accessibilityElement(children: .combine)
@@ -627,8 +642,13 @@ struct ServerDashboardView: View {
                     title: "Copy cURL",
                     subtitle: "Test command",
                     icon: "terminal",
+                    accessibilityLabel: copiedAccessibilityLabel(defaultLabel: "Copy cURL, Test command", copiedLabel: "cURL command copied", copiedMessage: "cURL command copied"),
+                    accessibilityValue: copiedAccessibilityValue(copiedMessage: "cURL command copied"),
                     action: {
-                        let cmd = "curl http://127.0.0.1:\(serverController.port)/api/tags"
+                        let token = loadBearerToken()
+                        let cmd = token.isEmpty
+                            ? "curl http://127.0.0.1:\(serverController.port)/api/tags"
+                            : "curl -H \"Authorization: Bearer \(token)\" http://127.0.0.1:\(serverController.port)/api/tags"
                         copyToClipboard(cmd, message: "cURL command copied")
                     }
                 )
@@ -676,7 +696,14 @@ struct ServerDashboardView: View {
         )
     }
     
-    private func actionButton(title: String, subtitle: String, icon: String, action: @escaping () -> Void) -> some View {
+    private func actionButton(
+        title: String,
+        subtitle: String,
+        icon: String,
+        accessibilityLabel: String? = nil,
+        accessibilityValue: String? = nil,
+        action: @escaping () -> Void
+    ) -> some View {
         Button(action: action) {
             VStack(spacing: 6) {
                 Image(systemName: icon)
@@ -699,7 +726,8 @@ struct ServerDashboardView: View {
             )
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("\(title), \(subtitle)")
+        .accessibilityLabel(accessibilityLabel ?? "\(title), \(subtitle)")
+        .accessibilityValue(accessibilityValue ?? "")
     }
     
     // MARK: - Test Connection Card
@@ -912,7 +940,12 @@ struct ServerDashboardView: View {
         Task {
             let url = URL(string: "http://127.0.0.1:\(serverController.port)/api/tags")!
             do {
-                let (data, response) = try await URLSession.shared.data(from: url)
+                var request = URLRequest(url: url)
+                let token = loadBearerToken()
+                if !token.isEmpty {
+                    request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                }
+                let (data, response) = try await URLSession.shared.data(for: request)
                 
                 if let httpResponse = response as? HTTPURLResponse {
                     if httpResponse.statusCode == 200 {
@@ -950,6 +983,42 @@ struct ServerDashboardView: View {
                 }
             }
         }
+    }
+
+    private func loadBearerToken() -> String {
+        ((try? String(contentsOf: LocalHTTPServer.tokenFileURL, encoding: .utf8)) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func isCopied(_ copiedMessage: String) -> Bool {
+        showCopiedToast && copiedText == copiedMessage
+    }
+
+    private func copiedAccessibilityLabel(defaultLabel: String, copiedLabel: String, copiedMessage: String) -> String {
+        isCopied(copiedMessage) ? copiedLabel : defaultLabel
+    }
+
+    private func copiedAccessibilityValue(copiedMessage: String) -> String {
+        isCopied(copiedMessage) ? "Copied to clipboard" : ""
+    }
+
+    private func authenticatedEndpointDetails(path: String, includeOpenAIBaseURL: Bool = false) -> String {
+        let baseURL = "http://127.0.0.1:\(serverController.port)"
+        let fullURL = "\(baseURL)\(path)"
+        let token = loadBearerToken()
+
+        var lines = ["URL: \(fullURL)"]
+        if includeOpenAIBaseURL {
+            lines.append("OpenAI Base URL: \(fullURL)")
+        }
+
+        if token.isEmpty {
+            lines.append("Authorization: Bearer <read token from \(LocalHTTPServer.tokenFileURL.path)>")
+        } else {
+            lines.append("Authorization: Bearer \(token)")
+        }
+
+        return lines.joined(separator: "\n")
     }
     
     private func addLog(_ message: String, type: LogType) {
