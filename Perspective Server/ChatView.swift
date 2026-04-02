@@ -90,9 +90,6 @@ final class ChatViewModel: ObservableObject {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if let token = try? String(contentsOf: LocalHTTPServer.tokenFileURL, encoding: .utf8) {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
         request.httpBody = try JSONEncoder().encode(reqBody)
 
         let (data, response) = try await URLSession.shared.data(for: request)

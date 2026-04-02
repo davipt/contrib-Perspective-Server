@@ -20,22 +20,24 @@ actor LocalHTTPServer {
     private var currentPortIndex: Int = 0
 
     // MARK: - Security
+    //
+    // Security model (no bearer token required):
+    // 1. Loopback-only binding — server is unreachable from the network
+    // 2. CORS origin allowlist — blocks random websites from using the AI
+    // 3. Host header validation — prevents DNS rebinding attacks
+    //
+    // Local apps (Continue, terminal, etc.) connect freely since they are
+    // already running on the user's machine with full filesystem access.
+    // This matches how Ollama and similar local AI servers handle security.
 
-    /// Bearer token required for all non-preflight requests
-    private var authToken: String?
-
-    private static let tokenDirectory: URL = {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return appSupport.appendingPathComponent("Perspective Server")
-    }()
-
-    static let tokenFileURL: URL = {
-        tokenDirectory.appendingPathComponent("auth_token")
-    }()
-
-    /// Hosts allowed to make cross-origin requests
+    /// Origins allowed to make cross-origin requests from a browser.
+    /// Localhost covers local dev and browser extensions.
+    /// The Perspective Intelligence web app is allowed so Basic tier users
+    /// can stream directly from the browser to their Mac.
     private static let allowedOriginHosts: Set<String> = [
-        "localhost", "127.0.0.1", "[::1]", "::1"
+        "localhost", "127.0.0.1", "[::1]", "::1",
+        "perspectiveintelligence.app",
+        "www.perspectiveintelligence.app",
     ]
 
     private init() {}
@@ -56,33 +58,6 @@ actor LocalHTTPServer {
 
     // MARK: - Security helpers
 
-    /// Generate a cryptographic auth token and write it to disk.
-    /// Local applications can read the file; web pages cannot.
-    private func generateAndStoreToken() throws {
-        let token = UUID().uuidString
-        authToken = nil
-
-        let fm = FileManager.default
-        try fm.createDirectory(at: Self.tokenDirectory, withIntermediateDirectories: true)
-        try token.write(to: Self.tokenFileURL, atomically: true, encoding: .utf8)
-        // Restrict file permissions to owner-only (0600)
-        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.tokenFileURL.path)
-
-        let persistedToken = try String(contentsOf: Self.tokenFileURL, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard persistedToken == token else {
-            throw NSError(
-                domain: "LocalHTTPServer",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "Persisted auth token did not match generated token"]
-            )
-        }
-
-        authToken = token
-
-        logger.log("Auth token written to \(Self.tokenFileURL.path, privacy: .public)")
-    }
-
     /// Validate Host header to prevent DNS rebinding attacks.
     nonisolated private static func isAllowedHost(_ host: String?, serverPort: UInt16) -> Bool {
         guard let host = host else { return true } // No Host header = direct TCP, not from browser
@@ -99,6 +74,8 @@ actor LocalHTTPServer {
     }
 
     /// Check if an Origin header value is in the allowlist by parsing the URL host.
+    /// Browser-enforced Origin headers cannot be spoofed by JavaScript, so this
+    /// provides reliable cross-origin protection without requiring a bearer token.
     nonisolated private static func isAllowedOrigin(_ origin: String?) -> Bool {
         guard let origin = origin else { return true } // No Origin = not a browser cross-origin request
         guard let url = URL(string: origin), let host = url.host else { return false }
@@ -114,11 +91,6 @@ actor LocalHTTPServer {
         return headers
     }
 
-    /// Return the current auth token (for UI display / copy-to-clipboard).
-    func getAuthToken() -> String? {
-        authToken
-    }
-
     // MARK: Lifecycle
 
     func start() async {
@@ -127,14 +99,6 @@ actor LocalHTTPServer {
             return
         }
         lastError = nil
-        do {
-            try generateAndStoreToken()
-        } catch {
-            authToken = nil
-            lastError = "Failed to persist auth token: \(error.localizedDescription)"
-            logger.error("\(self.lastError ?? "")")
-            return
-        }
         // Build port list: configured port first, then fallbacks (deduped)
         portsToTry = [port] + fallbackPorts.filter { $0 != port }
         currentPortIndex = 0
@@ -230,18 +194,10 @@ actor LocalHTTPServer {
             ], body: Data()))
         }
 
-        // 3. Validate Bearer token (authentication)
-        let expectedToken = await self.authToken
-        if let token = expectedToken {
-            let authHeader = request.headers["authorization"] ?? ""
-            let provided = authHeader.hasPrefix("Bearer ") ? String(authHeader.dropFirst(7)) : ""
-            if provided != token {
-                logger.warning("[req:\(rid, privacy: .public)] Blocked: invalid or missing auth token")
-                let msg = ["error": ["message": "Unauthorized: invalid or missing bearer token. Token is stored at \(Self.tokenFileURL.path)"]]
-                let data = (try? JSONSerialization.data(withJSONObject: msg, options: [])) ?? Data()
-                return .normal(HTTPResponse(status: 401, headers: Self.jsonHeaders(corsOrigin: corsOrigin), body: data))
-            }
-        }
+        // No bearer token required — security is provided by:
+        // 1. Loopback-only binding (not reachable from network)
+        // 2. CORS origin allowlist (blocks random websites)
+        // 3. Host header validation (blocks DNS rebinding)
 
         // Normalize path: strip query string and trailing slash
         let basePath: String = {
