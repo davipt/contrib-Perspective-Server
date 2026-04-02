@@ -29,6 +29,7 @@ struct ServerApp: App {
 final class ServerController: ObservableObject {
     @Published var isRunning: Bool = false
     @Published var port: UInt16 = 11434
+    @Published var pairingCode: String = ""
     @Published var errorMessage: String? = nil
 
     init() {
@@ -45,8 +46,10 @@ final class ServerController: ObservableObject {
             try? await Task.sleep(nanoseconds: 300_000_000) // 0.3 seconds
             let running = await LocalHTTPServer.shared.getIsRunning()
             let error = await LocalHTTPServer.shared.getLastError()
+            let code = await LocalHTTPServer.shared.pairingCode
             self.isRunning = running
             self.errorMessage = error
+            self.pairingCode = code
         }
     }
 
@@ -69,8 +72,10 @@ final class ServerController: ObservableObject {
             try? await Task.sleep(nanoseconds: 300_000_000) // 0.3 seconds
             let running = await LocalHTTPServer.shared.getIsRunning()
             let error = await LocalHTTPServer.shared.getLastError()
+            let code = await LocalHTTPServer.shared.pairingCode
             self.isRunning = running
             self.errorMessage = error
+            self.pairingCode = code
         }
     }
 
@@ -79,9 +84,11 @@ final class ServerController: ObservableObject {
             let running = await LocalHTTPServer.shared.getIsRunning()
             let serverPort = await LocalHTTPServer.shared.getPort()
             let error = await LocalHTTPServer.shared.getLastError()
+            let code = await LocalHTTPServer.shared.pairingCode
             self.isRunning = running
             self.port = serverPort
             self.errorMessage = error
+            self.pairingCode = code
         }
     }
 }

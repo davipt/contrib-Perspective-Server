@@ -40,6 +40,18 @@ actor LocalHTTPServer {
         "www.perspectiveintelligence.app",
     ]
 
+    // MARK: - Pairing
+
+    /// 6-digit pairing code for connecting the web app to this server.
+    /// Generated on each server start. User enters it in the web app to pair.
+    private(set) var pairingCode: String = ""
+
+    /// Generate a random 6-digit pairing code.
+    private func generatePairingCode() {
+        pairingCode = String(format: "%06d", Int.random(in: 0...999999))
+        logger.log("Pairing code generated: \(self.pairingCode, privacy: .public)")
+    }
+
     private init() {}
 
     func incrementActiveRequests() -> Int {
@@ -99,6 +111,7 @@ actor LocalHTTPServer {
             return
         }
         lastError = nil
+        generatePairingCode()
         // Build port list: configured port first, then fallbacks (deduped)
         portsToTry = [port] + fallbackPorts.filter { $0 != port }
         currentPortIndex = 0
@@ -198,6 +211,42 @@ actor LocalHTTPServer {
         // 1. Loopback-only binding (not reachable from network)
         // 2. CORS origin allowlist (blocks random websites)
         // 3. Host header validation (blocks DNS rebinding)
+
+        // --- Pairing endpoint ---
+        // POST /pair/verify { "code": "123456" }
+        // Returns 200 with server info if code matches, 403 if not.
+        // Only accessible from allowed origins (CORS validated above).
+        let rawPath = request.path.split(separator: "?").first.map(String.init) ?? request.path
+        if request.method == "POST" && rawPath == "/pair/verify" {
+            let currentCode = await self.pairingCode
+            guard !currentCode.isEmpty else {
+                let msg = ["error": ["message": "Pairing not available"]]
+                let data = (try? JSONSerialization.data(withJSONObject: msg, options: [])) ?? Data()
+                return .normal(HTTPResponse(status: 503, headers: Self.jsonHeaders(corsOrigin: corsOrigin), body: data))
+            }
+
+            // Parse the submitted code
+            var submittedCode = ""
+            if let json = try? JSONSerialization.jsonObject(with: request.bodyData) as? [String: Any],
+               let code = json["code"] as? String {
+                submittedCode = code.trimmingCharacters(in: .whitespaces)
+            }
+
+            if submittedCode == currentCode {
+                let serverPort = await self.port
+                let obj: [String: Any] = [
+                    "paired": true,
+                    "port": serverPort,
+                    "server": "Perspective Intelligence Server",
+                ]
+                let data = (try? JSONSerialization.data(withJSONObject: obj, options: [])) ?? Data()
+                return .normal(HTTPResponse(status: 200, headers: Self.jsonHeaders(corsOrigin: corsOrigin), body: data))
+            } else {
+                let msg = ["error": ["message": "Invalid pairing code"]]
+                let data = (try? JSONSerialization.data(withJSONObject: msg, options: [])) ?? Data()
+                return .normal(HTTPResponse(status: 403, headers: Self.jsonHeaders(corsOrigin: corsOrigin), body: data))
+            }
+        }
 
         // Normalize path: strip query string and trailing slash
         let basePath: String = {

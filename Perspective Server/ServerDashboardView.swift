@@ -237,11 +237,30 @@ struct ServerDashboardView: View {
                         .accessibilityValue(copiedAccessibilityValue(copiedMessage: "Base URL details copied"))
                         .accessibilityHint("Copies the base URL details to the clipboard")
                     }
+
+                    // Pairing code for web app connection
+                    HStack(spacing: 8) {
+                        Label("Pairing Code: \(serverController.pairingCode)", systemImage: "link.badge.plus")
+                            .font(.system(size: 13, design: .monospaced))
+                            .foregroundColor(.orange)
+
+                        Button(action: {
+                            copyToClipboard(serverController.pairingCode, message: "Pairing code copied")
+                        }) {
+                            Image(systemName: "doc.on.doc")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(copiedAccessibilityLabel(defaultLabel: "Copy pairing code", copiedLabel: "Pairing code copied", copiedMessage: "Pairing code copied"))
+                        .accessibilityValue(copiedAccessibilityValue(copiedMessage: "Pairing code copied"))
+                        .accessibilityHint("Copies the 6-digit pairing code for connecting the web app")
+                    }
                 }
             }
-            
+
             Spacer()
-            
+
             // Right side - Big action button
             Button(action: {
                 if serverController.isRunning {
